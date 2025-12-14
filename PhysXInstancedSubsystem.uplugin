@@ -1,0 +1,33 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.06",
+	"FriendlyName": "PhysXInstancedSubsystem",
+	"Description": "",
+	"Category": "Other",
+	"CreatedBy": "NordVader Inc.",
+	"CreatedByURL": "https://www.fab.com/sellers/NordVader%20Inc.",
+	"DocsURL": "",
+	"MarketplaceURL": "",
+	"SupportURL": "https://discord.gg/B8prpf3vzD",
+	"CanContainContent": true,
+	"IsBetaVersion": false,
+	"IsExperimentalVersion": false,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "PhysXInstancedSubsystem",
+			"Type": "Runtime",
+			"LoadingPhase": "PreLoadingScreen",
+			"PlatformAllowList": [
+				"Win64"
+			],
+			"PlatformDenyList": [
+				"IOS"
+			],
+			"AdditionalDependencies": [
+				"PhysicsCore"
+			]
+		}
+	]
+}

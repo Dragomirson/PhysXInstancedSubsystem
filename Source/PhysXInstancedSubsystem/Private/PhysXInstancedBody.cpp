@@ -90,12 +90,6 @@ void FPhysXInstanceBody::AddActorToScene(UWorld* World)
 
 namespace
 {
-	// Converts a UU scalar into PhysX units using the existing U2PVector conversion.
-	FORCEINLINE float U2PScalar(float ValueUU)
-	{
-		return U2PVector(FVector(ValueUU, 0.f, 0.f)).x;
-	}
-
 	PxTransform MakePxTransformForInstance(UInstancedStaticMeshComponent* InstancedMesh, int32 InstanceIndex)
 	{
 		const FTransform ComponentTM = InstancedMesh->GetComponentTransform();

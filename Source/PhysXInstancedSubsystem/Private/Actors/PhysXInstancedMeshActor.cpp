@@ -5,17 +5,102 @@
 */
 
 #include "Actors/PhysXInstancedMeshActor.h"
+
+#include "IImageWrapper.h"
+#include "IImageWrapperModule.h"
 #include "Components/PhysXInstancedStaticMeshComponent.h"
 #include "Subsystems/PhysXInstancedWorldSubsystem.h"
 
 #include "Engine/CollisionProfile.h"
 #include "Engine/StaticMesh.h"            // FStaticMaterial, GetStaticMaterials
 #include "Engine/World.h"
+#include "Interfaces/IPluginManager.h"
 #include "PhysicsEngine/BodyInstance.h"
+#include "UObject/StrongObjectPtr.h"
 
 // ============================================================================
 // APhysXInstancedMeshActor
 // ============================================================================
+
+#if WITH_EDITORONLY_DATA
+static UTexture2D* LoadPhysXBillboardIcon()
+{
+    static TStrongObjectPtr<UTexture2D> Cached;
+
+    if (Cached.IsValid())
+    {
+        return Cached.Get();
+    }
+
+    const TSharedPtr<IPlugin> Plugin = IPluginManager::Get().FindPlugin(TEXT("PhysXInstancedSubsystem"));
+    if (!Plugin.IsValid())
+    {
+        return nullptr;
+    }
+
+    const FString PngPath = FPaths::Combine(
+        Plugin->GetBaseDir(),
+        TEXT("Resources"),
+        TEXT("T_PhysXInstancedMeshActorIcon.png")
+    );
+
+    TArray<uint8> CompressedData;
+    if (!FFileHelper::LoadFileToArray(CompressedData, *PngPath))
+    {
+        return nullptr;
+    }
+
+    IImageWrapperModule& ImageWrapperModule =
+        FModuleManager::LoadModuleChecked<IImageWrapperModule>(TEXT("ImageWrapper"));
+
+    const TSharedPtr<IImageWrapper> Wrapper = ImageWrapperModule.CreateImageWrapper(EImageFormat::PNG);
+    if (!Wrapper.IsValid() || !Wrapper->SetCompressed(CompressedData.GetData(), CompressedData.Num()))
+    {
+        return nullptr;
+    }
+
+    TArray<uint8> RawBGRA;
+    if (!Wrapper->GetRaw(ERGBFormat::BGRA, 8, RawBGRA))
+    {
+        return nullptr;
+    }
+
+    const int32 Width  = Wrapper->GetWidth();
+    const int32 Height = Wrapper->GetHeight();
+
+    UTexture2D* Tex = UTexture2D::CreateTransient(Width, Height, PF_B8G8R8A8);
+    if (!Tex)
+    {
+        return nullptr;
+    }
+
+    // Make it look like an icon: no streaming, no mips.
+    Tex->NeverStream = true;
+    Tex->SRGB = true;
+
+#if ENGINE_MAJOR_VERSION >= 5
+    FTexturePlatformData* PlatformData = Tex->GetPlatformData();
+#else
+    FTexturePlatformData* PlatformData = Tex->PlatformData;
+#endif
+
+    if (!PlatformData || PlatformData->Mips.Num() == 0)
+    {
+        return nullptr;
+    }
+
+    FTexture2DMipMap& Mip = PlatformData->Mips[0];
+    void* MipData = Mip.BulkData.Lock(LOCK_READ_WRITE);
+    FMemory::Memcpy(MipData, RawBGRA.GetData(), RawBGRA.Num());
+    Mip.BulkData.Unlock();
+
+    Tex->UpdateResource();
+
+    Cached.Reset(Tex);
+    return Tex;
+}
+#endif
+
 
 /** Construct the actor and initialize defaults for rendering and instance behavior. */
 APhysXInstancedMeshActor::APhysXInstancedMeshActor()
@@ -41,6 +126,20 @@ APhysXInstancedMeshActor::APhysXInstancedMeshActor()
 
 	SceneRoot = CreateDefaultSubobject<USceneComponent>(TEXT("SceneRoot"));
 	SetRootComponent(SceneRoot);
+	
+	// --- Billboard ----------------------------------------------------------
+
+	#if WITH_EDITORONLY_DATA
+	PhysXBillboard = CreateDefaultSubobject<UBillboardComponent>(TEXT("PhysXBillboard"));
+	PhysXBillboard->SetupAttachment(SceneRoot);
+	PhysXBillboard->bHiddenInGame = true;
+	PhysXBillboard->SetIsVisualizationComponent(true);
+
+	if (UTexture2D* IconTex = LoadPhysXBillboardIcon())
+	{
+		PhysXBillboard->Sprite = IconTex;
+	}
+#endif
 
 	InstancedMesh = CreateDefaultSubobject<UPhysXInstancedStaticMeshComponent>(TEXT("InstancedMesh"));
 	InstancedMesh->SetupAttachment(SceneRoot);

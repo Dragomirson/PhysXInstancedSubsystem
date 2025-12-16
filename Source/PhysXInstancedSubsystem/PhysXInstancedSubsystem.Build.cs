@@ -41,6 +41,7 @@ public class PhysXInstancedSubsystem : ModuleRules
 				"Engine",
 				"PhysicsCore",
 				"NavigationSystem",
+				"Projects", // Required for import resource for Billboard
 			}
 		);
 

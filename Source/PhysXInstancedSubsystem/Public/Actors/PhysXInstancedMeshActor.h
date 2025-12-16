@@ -8,6 +8,7 @@
 
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
+#include "Components/BillboardComponent.h"
 
 #include "Engine/EngineTypes.h"            // ECollisionEnabled, FCollisionResponse, etc.
 #include "Engine/CollisionProfile.h"       // FCollisionProfileName
@@ -69,6 +70,11 @@ class APhysXInstancedMeshActor : public AActor
 
 public:
 	APhysXInstancedMeshActor();
+
+#if WITH_EDITORONLY_DATA
+	UPROPERTY()
+	class UBillboardComponent* PhysXBillboard = nullptr;
+#endif
 
 	// === Components ==========================================================
 

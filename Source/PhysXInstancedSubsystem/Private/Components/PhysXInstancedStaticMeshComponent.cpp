@@ -159,6 +159,8 @@ void UPhysXInstancedStaticMeshComponent::SetInstanceLocalTransformFromPhysX(
 
 	if (bMarkRenderStateDirty)
 	{
+		// IMPORTANT: make sure render data rebuild is triggered
+		InstanceUpdateCmdBuffer.NumEdits = 1;   // not ++
 		MarkRenderStateDirty();
 	}
 }
@@ -228,7 +230,7 @@ void UPhysXInstancedStaticMeshComponent::UpdateInstancesFromPhysXBatch_MT(
 			LocalTransforms[i] = WorldTransforms[i] * WorldToComponent;
 		}
 	}
-
+	
 	for (int32 i = 0; i < Count; ++i)
 	{
 		const int32 InstanceIndex = InstanceIndices[i];
@@ -243,7 +245,9 @@ void UPhysXInstancedStaticMeshComponent::UpdateInstancesFromPhysXBatch_MT(
 			/*bMarkRenderStateDirty*/ false,
 			bTeleport);
 	}
-
+	
+	// One per batch:
+	InstanceUpdateCmdBuffer.NumEdits = 1; 
 	MarkRenderStateDirty();
 }
 

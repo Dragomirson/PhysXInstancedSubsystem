@@ -7,7 +7,7 @@ Instead of spawning thousands of separate `AActor` / `UPrimitiveComponent` objec
 > **PhysX-only:** This plugin targets **UE4 PhysX** builds (`PHYSICS_INTERFACE_PHYSX`). Chaos builds are not supported.
 
 
-**Current Version: 1.06**
+**Current Version: 1.07**
 
 ***
 

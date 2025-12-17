@@ -9,12 +9,12 @@ Instead of spawning thousands of separate `AActor` / `UPrimitiveComponent` objec
 
 **Current Version: 1.07**
 
+**Changelog:** https://github.com/Dragomirson/PhysXInstancedSubsystem/wiki/Changelog
 ***
 
 ## Documentation (Wiki)
 
-Full documentation lives here:  
-https://github.com/Dragomirson/PhysXInstancedSubsystem/wiki/Documentation
+Full documentation lives here: https://github.com/Dragomirson/PhysXInstancedSubsystem/wiki/Documentation
 
 ***
 

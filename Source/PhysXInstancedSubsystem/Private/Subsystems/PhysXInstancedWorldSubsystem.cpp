@@ -87,11 +87,18 @@ void UPhysXInstancedWorldSubsystem::Initialize(FSubsystemCollectionBase& Collect
 {
 	Super::Initialize(Collection);
 
+	CachedWorld = GetWorld();
+	
+	PendingAddActorsHead = 0;
+	PendingAddActors.Reset();
+
 	Instances.Reset();
 	NextID = 1;
 
 	Actors.Reset();
 	NextActorID = 1;
+
+	NumBodiesLifetimeCreated = 0;
 
 #if PHYSICS_INTERFACE_PHYSX
 	// Create one default material for the whole lifetime of this subsystem.
@@ -111,6 +118,11 @@ void UPhysXInstancedWorldSubsystem::Initialize(FSubsystemCollectionBase& Collect
 
 void UPhysXInstancedWorldSubsystem::Deinitialize()
 {
+	CachedWorld.Reset();
+	
+	PendingAddActorsHead = 0;
+	PendingAddActors.Reset();
+
 #if PHYSICS_INTERFACE_PHYSX
 	// Destroy all bodies that were created by this subsystem.
 	for (TPair<FPhysXInstanceID, FPhysXInstanceData>& Pair : Instances)
@@ -241,10 +253,11 @@ FPhysXSpawnInstanceResult UPhysXInstancedWorldSubsystem::SpawnPhysicsInstance(
 				}
 
 				// Storage actors are not used for dynamic instance spawning.
-				if (Actor->bIsStorageActor)
+				if (Actor->bIsStorageActor || Actor->bStorageOnly)
 				{
 					continue;
 				}
+
 
 				UInstancedStaticMeshComponent* ISMC = Actor->InstancedMesh;
 				if (!ISMC)
@@ -459,8 +472,10 @@ FPhysXInstanceID UPhysXInstancedWorldSubsystem::RegisterInstance(
 		return FPhysXInstanceID();
 	}
 
+	
 	Instances.Add(NewID, NewData);
-
+	
+	++NumBodiesLifetimeCreated;
 	++NumBodiesTotal;
 	if (NewData.bSimulating)
 	{
@@ -577,6 +592,7 @@ void UPhysXInstancedWorldSubsystem::RegisterInstancesBatch(
 			NewData.bSimulating        = bSimulate;
 			NewData.SleepTime          = 0.0f;
 			NewData.FallTime           = 0.0f;
+			NewData.bWasSleeping       = false;
 
 			FPhysXInstanceData& StoredData = Instances.Add(NewID, NewData);
 
@@ -662,8 +678,10 @@ void UPhysXInstancedWorldSubsystem::RegisterInstancesBatch(
 
 			// Queue PhysX actor for scene insertion on the game thread.
 			EnqueueAddActorToScene(Job.ID, Job.ISMC);
-
+			
+			++NumBodiesLifetimeCreated;
 			++NumBodiesTotal;
+			
 			if (Job.Data && Job.Data->bSimulating)
 			{
 				++NumBodiesSimulating;
@@ -770,6 +788,8 @@ void UPhysXInstancedWorldSubsystem::AsyncPhysicsStep(float DeltaTime, float SimT
 		SET_DWORD_STAT(STAT_PhysXInstanced_BodiesSleeping,   NumBodiesSleeping);
 		SET_DWORD_STAT(STAT_PhysXInstanced_JobsPerFrame,     0);
 		SET_DWORD_STAT(STAT_PhysXInstanced_InstancesTotal,   Instances.Num());
+		const uint32 LifetimeClamped = (uint32)FMath::Min<uint64>(NumBodiesLifetimeCreated, (uint64)MAX_uint32);
+		SET_DWORD_STAT(STAT_PhysXInstanced_BodiesLifetimeCreated, LifetimeClamped);
 		return;
 	}
 
@@ -818,46 +838,41 @@ void UPhysXInstancedWorldSubsystem::AsyncPhysicsStep(float DeltaTime, float SimT
 		}
 	}
 
-	// Active actor count is available as NumActiveActorsFromScene; stat emission is currently disabled.
-	// SET_DWORD_STAT(STAT_PhysXInstanced_ActiveActorsFromScene, NumActiveActorsFromScene);
-
 	// --------------------------------------------------------------------
 	// Helper: fix indices after RemoveInstance
 	// --------------------------------------------------------------------
 
-	auto FixInstanceIndicesAfterRemoval = [this](UInstancedStaticMeshComponent* ISMC, int32 RemovedIndex)
+	auto FixInstanceIndicesAfterRemoval = [this](UInstancedStaticMeshComponent* ISMC, int32 RemovedIndex, int32 OldLastIndex)
 	{
 		if (!ISMC)
 		{
 			return;
 		}
-
-		const int32 NumInstances = ISMC->GetInstanceCount();
-		if (NumInstances <= 0 || RemovedIndex < 0 || RemovedIndex >= NumInstances)
+		
+		if (RemovedIndex < 0 || OldLastIndex < 0)
 		{
 			return;
 		}
-
-		// After RemoveInstance, the last instance moves into RemovedIndex.
+		
+		if (RemovedIndex == OldLastIndex)
+			{
+				return; 
+				}
+		
 		for (TPair<FPhysXInstanceID, FPhysXInstanceData>& OtherPair : Instances)
-		{
-			FPhysXInstanceData& OtherData = OtherPair.Value;
-
-			if (OtherData.InstancedComponent.Get() != ISMC)
 			{
-				continue;
-			}
-
-			if (OtherData.InstanceIndex == RemovedIndex)
-			{
-				// Mark the moved slot as unknown; mapping can be rebuilt by higher-level logic if needed.
-				OtherData.InstanceIndex = INDEX_NONE;
-			}
-			else if (OtherData.InstanceIndex > RemovedIndex)
-			{
-				--OtherData.InstanceIndex;
-			}
-		}
+				FPhysXInstanceData& OtherData = OtherPair.Value;
+				if (OtherData.InstancedComponent.Get() != ISMC)
+					{
+						continue;
+					}
+			
+				if (OtherData.InstanceIndex == OldLastIndex)
+					{
+						OtherData.InstanceIndex = RemovedIndex;
+						break;
+						}
+				}
 	};
 
 #if DO_GUARD_SLOW
@@ -1093,6 +1108,9 @@ void UPhysXInstancedWorldSubsystem::AsyncPhysicsStep(float DeltaTime, float SimT
 		SET_DWORD_STAT(STAT_PhysXInstanced_BodiesSimulating, NumBodiesSimulating);
 		SET_DWORD_STAT(STAT_PhysXInstanced_BodiesSleeping,   NumBodiesSleeping);
 		SET_DWORD_STAT(STAT_PhysXInstanced_JobsPerFrame,     0);
+		const uint32 LifetimeClamped = (uint32)FMath::Min<uint64>(NumBodiesLifetimeCreated, (uint64)MAX_uint32);
+		SET_DWORD_STAT(STAT_PhysXInstanced_BodiesLifetimeCreated, LifetimeClamped);
+
 		return;
 	}
 
@@ -1404,20 +1422,44 @@ void UPhysXInstancedWorldSubsystem::AsyncPhysicsStep(float DeltaTime, float SimT
 				if (ISMComponent && InstanceData->InstanceIndex != INDEX_NONE)
 				{
 					const int32 RemovedIndex = InstanceData->InstanceIndex;
-					ISMComponent->RemoveInstance(RemovedIndex);
-					FixInstanceIndicesAfterRemoval(ISMComponent, RemovedIndex);
-					InstanceData->InstanceIndex = INDEX_NONE;
+					const int32 OldLastIndex = ISMComponent->GetInstanceCount() - 1;
+					const bool bRemoved = ISMComponent->RemoveInstance(RemovedIndex);
+					if (bRemoved)
+					{
+						FixInstanceIndicesAfterRemoval(ISMComponent, RemovedIndex, OldLastIndex);
+						InstanceData->InstanceIndex = INDEX_NONE;
+						DirtyComponents.Add(ISMComponent);
+					}
+					else
+					{
+						
+					}
 
 					DirtyComponents.Add(ISMComponent);
 				}
 				break;
 			}
-
+				
 			case EPhysXInstanceStopAction::ConvertToStorage:
-				// Current implementation removes the PhysX body while keeping the visual instance.
-				InstanceData->Body.Destroy();
-				InstanceData->bSimulating = false;
-				break;
+				{
+					const FPhysXInstanceID ConvertID = JobData.ID;
+
+					// Moves to storage actor and unregisters this ID from subsystem.
+					if (ConvertInstanceToStaticStorage(ConvertID, /*bCreateStorageActorIfNeeded=*/true))
+					{
+						// IMPORTANT: ConvertInstanceToStaticStorage() calls UnregisterInstance(),
+						// which removes the entry from Instances -> JobData.Data pointer becomes invalid.
+						JobData.Data         = nullptr;
+						JobData.ISMC         = nullptr;
+						JobData.RigidDynamic = nullptr;
+						return; // Exit the lambda immediately.
+					}
+
+					// Fallback if conversion failed:
+					InstanceData->Body.Destroy();
+					InstanceData->bSimulating = false;
+					break;
+				}
 
 			default:
 				break;
@@ -1450,12 +1492,20 @@ void UPhysXInstancedWorldSubsystem::AsyncPhysicsStep(float DeltaTime, float SimT
 			if (JobData.bApplyStopAction && JobData.ActionToApply != EPhysXInstanceStopAction::None)
 			{
 				ApplyStopAction_GameThread(JobData);
+
+				// After ConvertToStorage the instance may be unregistered -> pointer becomes invalid.
+				InstanceData = JobData.Data;
+				if (!InstanceData)
+				{
+					continue; // Converted & unregistered -> skip rest of this job in PASS 1
+				}
 			}
 			else
 			{
 				InstanceData->SleepTime = JobData.NewSleepTime;
 				InstanceData->FallTime  = JobData.NewFallTime;
 			}
+
 
 			if (JobData.bSleeping)
 			{
@@ -1562,6 +1612,11 @@ void UPhysXInstancedWorldSubsystem::AsyncPhysicsStep(float DeltaTime, float SimT
 	SET_DWORD_STAT(STAT_PhysXInstanced_BodiesSimulating, NumBodiesSimulating);
 	SET_DWORD_STAT(STAT_PhysXInstanced_BodiesSleeping,   NumBodiesSleeping);
 
+	const uint32 LifetimeClamped =
+	(uint32)FMath::Min<uint64>(NumBodiesLifetimeCreated, (uint64)MAX_uint32);
+
+	SET_DWORD_STAT(STAT_PhysXInstanced_BodiesLifetimeCreated, LifetimeClamped);
+
 #endif // PHYSICS_INTERFACE_PHYSX
 }
 
@@ -1635,6 +1690,8 @@ bool UPhysXInstancedWorldSubsystem::SetInstancePhysicsEnabled(
 			{
 				return false;
 			}
+
+			++NumBodiesLifetimeCreated;
 
 			Actor        = Data->Body.GetPxActor();
 			RigidDynamic = Actor ? Actor->is<physx::PxRigidDynamic>() : nullptr;
@@ -1775,7 +1832,11 @@ bool UPhysXInstancedWorldSubsystem::ConvertInstanceToStaticStorage(
 		const int32 NumB = B->InstanceOverrideMaterials.Num();
 		const int32 Num  = FMath::Min(NumA, NumB);
 
-		for (int32 Index = 0; Index < Num; ++Index)
+		if (NumA != NumB)
+		{
+			return false;
+		}
+		for (int32 Index = 0; Index < NumA; ++Index)
 		{
 			if (A->InstanceOverrideMaterials[Index] != B->InstanceOverrideMaterials[Index])
 			{
@@ -1847,6 +1908,7 @@ bool UPhysXInstancedWorldSubsystem::ConvertInstanceToStaticStorage(
 
 		// Storage mode settings.
 		StorageActor->bStorageOnly       = true;
+		StorageActor->bIsStorageActor    = true;
 		StorageActor->bSimulateInstances = false;
 		StorageActor->bDisableISMPhysics = false;
 
@@ -1869,17 +1931,15 @@ bool UPhysXInstancedWorldSubsystem::ConvertInstanceToStaticStorage(
 
 			StorageISMC->SetSimulatePhysics(false);
 
-			FBodyInstance& StorageBody = StorageISMC->BodyInstance;
-
-			if (StorageActor->StorageCollisionProfile.Name != NAME_None)
-			{
-				StorageBody.SetCollisionProfileName(StorageActor->StorageCollisionProfile.Name);
-			}
-			else if (StorageActor->InstancesCollisionProfile.Name != NAME_None)
-			{
-				StorageBody.SetCollisionProfileName(StorageActor->InstancesCollisionProfile.Name);
-			}
-
+			const FName StorageProfile =
+				(StorageActor->StorageCollisionProfile.Name != NAME_None)
+			? StorageActor->StorageCollisionProfile.Name
+			: StorageActor->InstancesCollisionProfile.Name;
+			if (StorageProfile != NAME_None)
+				{
+				StorageISMC->SetCollisionProfileName(StorageProfile);
+				}
+			
 			StorageISMC->SetCollisionEnabled(StorageActor->StorageCollisionEnabled);
 
 			StorageISMC->SetInstancesAffectNavigation(
@@ -1922,7 +1982,25 @@ bool UPhysXInstancedWorldSubsystem::ConvertInstanceToStaticStorage(
 		/*bWorldSpace=*/true,
 		/*bMarkRenderStateDirty=*/true,
 		/*bTeleport=*/true);
-
+	
+	// Keep the ISM index -> ID mapping stable: the visual instance is NOT removed, only hidden.
+	// So we invalidate the entry instead of compacting the array.
+	if (SourceActor)
+		{
+			if (SourceActor->RegisteredInstanceIDs.IsValidIndex(InstanceIndex) &&
+				SourceActor->RegisteredInstanceIDs[InstanceIndex] == ID)
+				{
+		SourceActor->RegisteredInstanceIDs[InstanceIndex] = FPhysXInstanceID(); // invalid
+		}
+			else
+				{
+		const int32 Found = SourceActor->RegisteredInstanceIDs.IndexOfByKey(ID);
+		if (Found != INDEX_NONE)
+			{
+				SourceActor->RegisteredInstanceIDs[Found] = FPhysXInstanceID(); // invalid
+				}
+		}
+		}
 	// Destroy the PhysX body and remove the instance record from the subsystem.
 	UnregisterInstance(ID);
 
@@ -2591,30 +2669,45 @@ void UPhysXInstancedWorldSubsystem::EnqueueAddActorToScene(
 	FPendingAddActorEntry Entry;
 	Entry.ID = ID;
 	Entry.InstancedComponent = InstancedMesh;
-
+	Entry.World = InstancedMesh->GetWorld(); // cache once per entry
+	
 	PendingAddActors.Add(Entry);
 }
 
+
+
 void UPhysXInstancedWorldSubsystem::ProcessPendingAddActors()
 {
-	if (PendingAddActors.Num() == 0)
+	const int32 NumPending = PendingAddActors.Num() - PendingAddActorsHead;
+	if (NumPending <= 0)
+	{
+		PendingAddActors.Reset();
+		PendingAddActorsHead = 0;
+		return;
+	}
+
+	UWorld* World = CachedWorld.Get();
+	if (!World)
+	{
+		World = GetWorld();
+		if (World)
+		{
+			CachedWorld = World;
+		}
+	}
+	if (!World)
 	{
 		return;
 	}
 
 	int32 Budget = MaxAddActorsPerFrame;
-	if (Budget <= 0)
-	{
-		Budget = PendingAddActors.Num();
-	}
+	Budget = (Budget <= 0) ? NumPending : FMath::Min(Budget, NumPending);
 
-	int32 NumProcessed = 0;
+	const int32 EndIndex = PendingAddActorsHead + Budget;
 
-	while (PendingAddActors.Num() > 0 && NumProcessed < Budget)
+	for (int32 Index = PendingAddActorsHead; Index < EndIndex; ++Index)
 	{
-		FPendingAddActorEntry Entry = PendingAddActors[0];
-		PendingAddActors.RemoveAt(0);
-		++NumProcessed;
+		const FPendingAddActorEntry& Entry = PendingAddActors[Index];
 
 		if (!Entry.ID.IsValid())
 		{
@@ -2627,8 +2720,8 @@ void UPhysXInstancedWorldSubsystem::ProcessPendingAddActors()
 			continue;
 		}
 
-		UWorld* World = ISMC->GetWorld();
-		if (!World)
+		UWorld* EntryWorld = Entry.World.Get();
+		if (!EntryWorld || EntryWorld != World)
 		{
 			continue;
 		}
@@ -2639,11 +2732,23 @@ void UPhysXInstancedWorldSubsystem::ProcessPendingAddActors()
 			continue;
 		}
 
-		// Body helper checks internal pointers and avoids double-add.
-		Data->Body.AddActorToScene(World);
+		Data->Body.AddActorToScene(EntryWorld);
 	}
 
+	PendingAddActorsHead = EndIndex;
+
+	if (PendingAddActorsHead >= PendingAddActors.Num())
+	{
+		PendingAddActors.Reset();
+		PendingAddActorsHead = 0;
+	}
+	else if (PendingAddActorsHead > 1024 && PendingAddActorsHead * 2 >= PendingAddActors.Num())
+	{
+		PendingAddActors.RemoveAt(0, PendingAddActorsHead, /*bAllowShrinking=*/false);
+		PendingAddActorsHead = 0;
+	}
 }
+
 
 int32 UPhysXInstancedWorldSubsystem::GetMaxAddActorsPerFrame() const
 {

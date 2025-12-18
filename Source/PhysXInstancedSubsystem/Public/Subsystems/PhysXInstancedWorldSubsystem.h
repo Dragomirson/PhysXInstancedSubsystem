@@ -314,6 +314,12 @@ public:
 	void SetMaxAddActorsPerFrame(int32 NewMax);
 
 private:
+	
+	// Cached owning world to avoid calling GetWorld() / component->GetWorld() in hot paths.
+	TWeakObjectPtr<UWorld> CachedWorld;
+	
+	int32 PendingAddActorsHead = 0;
+
 	// === Storage =============================================================
 
 	/** Per-instance storage, keyed by FPhysXInstanceID (uint32 handle). */
@@ -329,6 +335,9 @@ private:
 	uint32 NextActorID = 1;
 
 	// === Runtime counters ====================================================
+
+	// Lifetime counter: total number of PhysX bodies ever created during this subsystem lifetime.
+	uint64 NumBodiesLifetimeCreated = 0;
 
 	/** Total number of instance records tracked by the subsystem. */
 	int32 NumBodiesTotal = 0;
@@ -362,6 +371,9 @@ private:
 	{
 		FPhysXInstanceID ID;
 		TWeakObjectPtr<UInstancedStaticMeshComponent> InstancedComponent;
+		
+		// Cached world at enqueue time to avoid GetWorld() virtual calls in the hot loop.
+		TWeakObjectPtr<UWorld> World;
 	};
 
 	/** Queue of bodies that still need to be added to the PhysX scene. */

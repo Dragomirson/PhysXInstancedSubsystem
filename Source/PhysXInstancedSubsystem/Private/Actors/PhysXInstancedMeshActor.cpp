@@ -208,6 +208,43 @@ APhysXInstancedMeshActor::APhysXInstancedMeshActor()
 	StorageCollisionEnabled        = ECollisionEnabled::QueryAndPhysics;
 }
 
+void APhysXInstancedMeshActor::ApplyCollisionSettings()
+{
+	if (!InstancedMesh)
+		return;
+
+	InstancedMesh->SetSimulatePhysics(false);
+
+	if (bStorageOnly)
+	{
+		const FName Profile =
+			(StorageCollisionProfile.Name != NAME_None)
+				? StorageCollisionProfile.Name
+				: InstancesCollisionProfile.Name;
+
+		if (Profile != NAME_None)
+		{
+			InstancedMesh->SetCollisionProfileName(Profile);
+		}
+
+		InstancedMesh->SetCollisionEnabled(StorageCollisionEnabled);
+		InstancedMesh->SetInstancesAffectNavigation(bStorageInstancesAffectNavigation);
+	}
+	else
+	{
+		if (InstancesCollisionProfile.Name != NAME_None)
+		{
+			InstancedMesh->SetCollisionProfileName(InstancesCollisionProfile.Name);
+		}
+
+		InstancedMesh->SetCollisionEnabled(
+			bDisableISMPhysics ? ECollisionEnabled::NoCollision
+							   : ECollisionEnabled::QueryAndPhysics);
+
+		InstancedMesh->SetInstancesAffectNavigation(bInstancesAffectNavigation);
+	}
+}
+
 /** Apply editor/runtime property state to the InstancedMesh component. */
 void APhysXInstancedMeshActor::OnConstruction(const FTransform& Transform)
 {
@@ -226,11 +263,6 @@ void APhysXInstancedMeshActor::OnConstruction(const FTransform& Transform)
 
 	// --- Navigation flags ----------------------------------------------------
 
-	if (InstancedMesh)
-	{
-		InstancedMesh->SetInstancesAffectNavigation(bInstancesAffectNavigation);
-	}
-
 	// Keep the component under this actor transform (visual alignment only).
 	InstancedMesh->SetWorldLocationAndRotation(
 		Transform.GetLocation(),
@@ -243,10 +275,11 @@ void APhysXInstancedMeshActor::OnConstruction(const FTransform& Transform)
 	ApplyInstanceMaterials();
 
 	// Apply collision profile to the InstancedMesh body instance.
+	
 	if (InstancesCollisionProfile.Name != NAME_None)
-	{
-		InstancedMesh->BodyInstance.SetCollisionProfileName(InstancesCollisionProfile.Name);
-	}
+		{
+		InstancedMesh->SetCollisionProfileName(InstancesCollisionProfile.Name);
+		}
 
 	// Apply mass and damping overrides to the BodyInstance.
 	// Subsystem-created PhysX bodies read these settings when spawning.
@@ -262,7 +295,18 @@ void APhysXInstancedMeshActor::OnConstruction(const FTransform& Transform)
 	if (bStorageOnly)
 	{
 		InstancedMesh->SetSimulatePhysics(false);
-		InstancedMesh->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
+		
+		if (StorageCollisionProfile.Name != NAME_None)
+		{
+			InstancedMesh->SetCollisionProfileName(StorageCollisionProfile.Name);
+		}
+		else if (InstancesCollisionProfile.Name != NAME_None)
+		{
+			InstancedMesh->SetCollisionProfileName(InstancesCollisionProfile.Name);
+		}
+
+		InstancedMesh->SetCollisionEnabled(StorageCollisionEnabled);
+		InstancedMesh->SetInstancesAffectNavigation(bStorageInstancesAffectNavigation);
 	}
 	else if (bDisableISMPhysics)
 	{
@@ -357,14 +401,14 @@ void APhysXInstancedMeshActor::BeginPlay()
 			InstancedMesh->SetSimulatePhysics(false);
 
 			if (StorageCollisionProfile.Name != NAME_None)
-			{
-				BodyInstance.SetCollisionProfileName(StorageCollisionProfile.Name);
-			}
+				{
+				InstancedMesh->SetCollisionProfileName(StorageCollisionProfile.Name);
+				}
 			else if (InstancesCollisionProfile.Name != NAME_None)
-			{
-				BodyInstance.SetCollisionProfileName(InstancesCollisionProfile.Name);
-			}
-
+				{
+				InstancedMesh->SetCollisionProfileName(InstancesCollisionProfile.Name);
+				}
+			
 			InstancedMesh->SetCollisionEnabled(StorageCollisionEnabled);
 			InstancedMesh->SetInstancesAffectNavigation(bStorageInstancesAffectNavigation);
 		}
@@ -375,9 +419,9 @@ void APhysXInstancedMeshActor::BeginPlay()
 
 			if (InstancesCollisionProfile.Name != NAME_None)
 			{
-				BodyInstance.SetCollisionProfileName(InstancesCollisionProfile.Name);
+				InstancedMesh->SetCollisionProfileName(InstancesCollisionProfile.Name);
 			}
-
+			
 			if (bDisableISMPhysics)
 			{
 				// Visual-only: collision is disabled; all collision/physics comes from subsystem bodies.

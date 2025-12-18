@@ -72,3 +72,6 @@ Plugins/**/Intermediate/*
 
 # Cache files for the editor to use
 DerivedDataCache/*
+show_diff.bat
+changes_diff.txt
+changes_files.txt

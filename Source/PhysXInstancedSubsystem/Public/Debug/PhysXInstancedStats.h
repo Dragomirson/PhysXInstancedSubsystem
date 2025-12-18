@@ -62,6 +62,8 @@ DECLARE_CYCLE_STAT_EXTERN(TEXT("Register - ParallelFor"), STAT_PhysXInstanced_Re
 /** Async step: number of jobs (simulated bodies) processed this frame. */
 DECLARE_DWORD_COUNTER_STAT_EXTERN(TEXT("Async Jobs Per Frame"), STAT_PhysXInstanced_JobsPerFrame, STATGROUP_PhysXInstanced, );
 
+DECLARE_DWORD_COUNTER_STAT(TEXT("PhysX Bodies Lifetime Created"), STAT_PhysXInstanced_BodiesLifetimeCreated, STATGROUP_PhysXInstanced);
+
 /** Total number of PhysX bodies tracked by the instanced subsystem. */
 DECLARE_DWORD_COUNTER_STAT_EXTERN(TEXT("Bodies Total"), STAT_PhysXInstanced_BodiesTotal, STATGROUP_PhysXInstanced, );
 

@@ -70,6 +70,7 @@ class APhysXInstancedMeshActor : public AActor
 
 public:
 	APhysXInstancedMeshActor();
+	void ApplyCollisionSettings();
 
 #if WITH_EDITORONLY_DATA
 	UPROPERTY()

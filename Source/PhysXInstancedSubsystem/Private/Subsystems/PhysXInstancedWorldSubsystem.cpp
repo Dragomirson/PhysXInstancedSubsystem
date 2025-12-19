@@ -776,18 +776,19 @@ void UPhysXInstancedWorldSubsystem::AsyncPhysicsStep(float DeltaTime, float SimT
 	return;
 #else
 
-	// Fast early-out: there are no simulating bodies at all.
-	if (NumBodiesSimulating <= 0)
+	// Early-out only when nothing is registered at all.
+	if (Instances.Num() == 0)
 	{
-		NumBodiesTotal      = 0;
+		NumBodiesTotal = 0;
 		NumBodiesSimulating = 0;
-		NumBodiesSleeping   = 0;
+		NumBodiesSleeping = 0;
 
-		SET_DWORD_STAT(STAT_PhysXInstanced_BodiesTotal,      NumBodiesTotal);
-		SET_DWORD_STAT(STAT_PhysXInstanced_BodiesSimulating, NumBodiesSimulating);
-		SET_DWORD_STAT(STAT_PhysXInstanced_BodiesSleeping,   NumBodiesSleeping);
+		SET_DWORD_STAT(STAT_PhysXInstanced_BodiesTotal,      0);
+		SET_DWORD_STAT(STAT_PhysXInstanced_BodiesSimulating, 0);
+		SET_DWORD_STAT(STAT_PhysXInstanced_BodiesSleeping,   0);
 		SET_DWORD_STAT(STAT_PhysXInstanced_JobsPerFrame,     0);
-		SET_DWORD_STAT(STAT_PhysXInstanced_InstancesTotal,   Instances.Num());
+		SET_DWORD_STAT(STAT_PhysXInstanced_InstancesTotal,   0);
+
 		const uint32 LifetimeClamped = (uint32)FMath::Min<uint64>(NumBodiesLifetimeCreated, (uint64)MAX_uint32);
 		SET_DWORD_STAT(STAT_PhysXInstanced_BodiesLifetimeCreated, LifetimeClamped);
 		return;
@@ -952,7 +953,7 @@ void UPhysXInstancedWorldSubsystem::AsyncPhysicsStep(float DeltaTime, float SimT
 		int32 NumJobsAdded = 0;
 
 		// Active-actor filtering is used only when the scene provides an active list.
-		const bool bUseActiveActorFilter = (ActiveActorsSet.Num() > 0);
+		const bool bUseActiveActorFilter = (ActiveActorsSet.Num() > 0) && (PxScenePtr != nullptr);
 
 		for (TPair<FPhysXInstanceID, FPhysXInstanceData>& Pair : Instances)
 		{
@@ -1017,7 +1018,12 @@ void UPhysXInstancedWorldSubsystem::AsyncPhysicsStep(float DeltaTime, float SimT
 			bool bIsActiveActor = true;
 			if (bUseActiveActorFilter)
 			{
-				bIsActiveActor = ActiveActorsSet.Contains(RigidActor);
+				// Only trust ActiveActorsSet if we queried the SAME PxScene the body belongs to.
+				if (RigidDynamic->getScene() == PxScenePtr)
+				{
+					bIsActiveActor = ActiveActorsSet.Contains(RigidActor);
+				}
+				// If scenes differ (Sync vs Async), do NOT filter by ActiveActorsSet.
 			}
 
 			// Bodies reported as inactive by the scene are treated as sleeping and do not produce jobs.
@@ -2733,6 +2739,21 @@ void UPhysXInstancedWorldSubsystem::ProcessPendingAddActors()
 		}
 
 		Data->Body.AddActorToScene(EntryWorld);
+		
+		// Force-start simulation for instances that were registered as simulating.
+		// This fixes Manual/Grid bodies that may enter the scene sleeping and never wake.
+		if (Data->bSimulating)
+		{
+			if (physx::PxRigidActor* PxActor = Data->Body.GetPxActor())
+			{
+				if (physx::PxRigidDynamic* RD = PxActor->is<physx::PxRigidDynamic>())
+				{
+					RD->setActorFlag(physx::PxActorFlag::eDISABLE_SIMULATION, false);
+					RD->setRigidBodyFlag(physx::PxRigidBodyFlag::eKINEMATIC, false);
+					RD->wakeUp();
+				}
+			}
+		}
 	}
 
 	PendingAddActorsHead = EndIndex;

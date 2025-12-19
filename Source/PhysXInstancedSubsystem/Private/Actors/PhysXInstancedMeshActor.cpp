@@ -268,8 +268,10 @@ void APhysXInstancedMeshActor::OnConstruction(const FTransform& Transform)
 		Transform.GetLocation(),
 		Transform.GetRotation());
 
-	// Sync static mesh from the actor property.
-	InstancedMesh->SetStaticMesh(InstanceStaticMesh);
+	if (InstanceStaticMesh && InstancedMesh->GetStaticMesh() != InstanceStaticMesh)
+	{
+		InstancedMesh->SetStaticMesh(InstanceStaticMesh);
+	}
 
 	// Apply either mesh materials or actor overrides.
 	ApplyInstanceMaterials();

@@ -121,6 +121,14 @@ enum class EPhysXInstanceStopAction : uint8
 	ConvertToStorage UMETA(DisplayName = "Convert to storage")
 };
 
+UENUM(BlueprintType)
+enum class EPhysXInstancedQueryDebugMode : uint8
+{
+	None     UMETA(DisplayName = "None"),
+	Basic    UMETA(DisplayName = "Basic"),
+	Detailed UMETA(DisplayName = "Detailed"),
+};
+
 /**
  * Configuration for automatic "stop" handling of instances.
  * This can be owned by an actor and read by the subsystem for each instance.
@@ -263,6 +271,11 @@ public:
 	{
 		return UniqueID == Other.UniqueID;
 	}
+	
+	bool operator!=(const FPhysXInstanceID& Other) const
+	{
+		return UniqueID != Other.UniqueID;
+	}
 };
 
 /** Hash function so FPhysXInstanceID can be used as a TMap key. */
@@ -314,6 +327,11 @@ public:
 	bool operator==(const FPhysXActorID& Other) const
 	{
 		return UniqueID == Other.UniqueID;
+	}
+	
+	bool operator!=(const FPhysXActorID& Other) const
+	{
+		return UniqueID != Other.UniqueID;
 	}
 };
 
@@ -617,3 +635,5 @@ struct FPhysXInstanceParallelResult
 	 */
 	bool bReachedMinStoppedTime = false;
 };
+
+

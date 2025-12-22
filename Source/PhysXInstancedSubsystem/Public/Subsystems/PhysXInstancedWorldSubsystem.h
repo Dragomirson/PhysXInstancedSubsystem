@@ -92,6 +92,11 @@ public:
 	 */
 	void UnregisterInstance(FPhysXInstanceID ID);
 
+	bool RemoveInstanceByID(FPhysXInstanceID ID, bool bRemoveVisualInstance);
+	
+	UFUNCTION(BlueprintCallable, Category = "Phys X Instance|Removal")
+	bool RemoveInstance(FPhysXInstanceID ID, bool bRemoveVisualInstance = true);
+
 	// === Physics update ======================================================
 
 	/**
@@ -109,7 +114,8 @@ public:
 	/**
 	 * Convert a dynamic PhysX-backed instance into a static ISM instance stored on a storage-only actor.
 	 *
-	 * The PhysX body is destroyed and the instance is removed from the subsystem.
+	 * The PhysX body is destroyed and the instance is re-bound to a storage ISM component/index.
+	 * The stable FPhysXInstanceID remains valid.
 	 * A new visual instance with collision is added to a storage actor that matches
 	 * the source mesh and materials.
 	 */
@@ -139,26 +145,68 @@ public:
 	// === Forces / impulses ===================================================
 
 	/**
-	 * Add a world-space impulse to the instance.
-	 * The impulse is applied at the body's center of mass.
-	 *
-	 * @param ID           Instance handle.
-	 * @param WorldImpulse Impulse vector in Unreal world units.
-	 * @param bVelChange   If true, ignores mass and treats the impulse as a direct velocity change.
-	 */
-	UFUNCTION(BlueprintCallable, Category = "Phys X Instance|Forces")
-	bool AddImpulseToInstance(FPhysXInstanceID ID, FVector WorldImpulse, bool bVelChange = false);
+ * Add a world-space impulse to the instance.
+ * The impulse is applied at the body's center of mass.
+ *
+ * NOTE:
+ * - If the instance currently belongs to a storage actor, it can be converted to dynamic first
+ *   (see AddImpulseToInstanceAdvanced).
+ */
+UFUNCTION(BlueprintCallable, Category = "Phys X Instance|Forces")
+bool AddImpulseToInstance(FPhysXInstanceID ID, FVector WorldImpulse, bool bVelChange = false);
 
-	/**
-	 * Add a continuous world-space force to the instance.
-	 * The force is applied at the body's center of mass.
-	 *
-	 * @param ID           Instance handle.
-	 * @param WorldForce   Force vector in Unreal world units.
-	 * @param bAccelChange If true, treats the value as acceleration (independent of mass).
-	 */
-	UFUNCTION(BlueprintCallable, Category = "Phys X Instance|Forces")
-	bool AddForceToInstance(FPhysXInstanceID ID, FVector WorldForce, bool bAccelChange = false);
+/**
+ * Advanced version of AddImpulseToInstance with explicit storage handling.
+ *
+ * @param bIncludeStorage           If true, storage-owned instances are allowed.
+ * @param bConvertStorageToDynamic  If true and the instance is on a storage actor, it will be converted to dynamic first.
+ */
+UFUNCTION(BlueprintCallable, Category = "Phys X Instance|Forces",
+	meta = (AdvancedDisplay = "bIncludeStorage,bConvertStorageToDynamic"))
+bool AddImpulseToInstanceAdvanced(
+	FPhysXInstanceID ID,
+	FVector WorldImpulse,
+	bool bVelChange = false,
+	bool bIncludeStorage = true,
+	bool bConvertStorageToDynamic = true);
+
+/**
+ * Add a continuous world-space force to the instance.
+ *
+ * NOTE:
+ * - If the instance currently belongs to a storage actor, it can be converted to dynamic first
+ *   (see AddForceToInstanceAdvanced).
+ */
+UFUNCTION(BlueprintCallable, Category = "Phys X Instance|Forces")
+bool AddForceToInstance(FPhysXInstanceID ID, FVector WorldForce, bool bAccelChange = false);
+
+/**
+ * Advanced version of AddForceToInstance with explicit storage handling.
+ */
+UFUNCTION(BlueprintCallable, Category = "Phys X Instance|Forces",
+	meta = (AdvancedDisplay = "bIncludeStorage,bConvertStorageToDynamic"))
+bool AddForceToInstanceAdvanced(
+	FPhysXInstanceID ID,
+	FVector WorldForce,
+	bool bAccelChange = false,
+	bool bIncludeStorage = true,
+	bool bConvertStorageToDynamic = true);
+
+/** Put the instance's rigid body to sleep (advanced storage handling). */
+UFUNCTION(BlueprintCallable, Category = "Phys X Instance|Forces",
+	meta = (AdvancedDisplay = "bIncludeStorage,bConvertStorageToDynamic"))
+bool PutInstanceToSleepAdvanced(
+	FPhysXInstanceID ID,
+	bool bIncludeStorage = true,
+	bool bConvertStorageToDynamic = true);
+
+/** Wake the instance's rigid body (advanced storage handling). */
+UFUNCTION(BlueprintCallable, Category = "Phys X Instance|Forces",
+	meta = (AdvancedDisplay = "bIncludeStorage,bConvertStorageToDynamic"))
+bool WakeInstanceUpAdvanced(
+	FPhysXInstanceID ID,
+	bool bIncludeStorage = true,
+	bool bConvertStorageToDynamic = true);
 
 	/** Put the instance's rigid body to sleep (if it exists and is dynamic). */
 	UFUNCTION(BlueprintCallable, Category = "Phys X Instance|Forces")
@@ -167,6 +215,39 @@ public:
 	/** Wake the instance's rigid body so it starts simulating again. */
 	UFUNCTION(BlueprintCallable, Category = "Phys X Instance|Forces")
 	bool WakeInstanceUp(FPhysXInstanceID ID);
+
+	/**
+ * Convert a storage-only instance (no PhysX body) into a dynamic instance:
+ * - Moves the visual ISM instance from a storage actor to a non-storage actor.
+ * - Creates a PhysX body for the moved instance.
+ * - Keeps the same stable FPhysXInstanceID.
+ */
+	UFUNCTION(BlueprintCallable, Category = "Phys X Instance|Conversion")
+	bool ConvertStorageInstanceToDynamic(FPhysXInstanceID ID, bool bCreateDynamicActorIfNeeded = true);
+
+	/**
+	 * Apply a radial impulse around OriginWorld to all instances within Radius.
+	 *
+	 * If bIncludeStorage is true and a hit instance belongs to a storage actor,
+	 * it is converted to dynamic first (when bConvertStorageToDynamic is true),
+	 * then the impulse is applied.
+	 *
+	 * @param Strength        Impulse strength in UU units (same convention as AddImpulseToInstance).
+	 * @param bVelChange      If true, treat Strength as a direct velocity change (mass-independent).
+	 * @param bLinearFalloff  If true, impulse scales by (1 - Distance/Radius).
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Phys X Instance|Forces",
+		meta = (AdvancedDisplay = "bIncludeStorage,bConvertStorageToDynamic,bLinearFalloff,DebugMode,DebugDrawDuration"))
+	bool AddRadialImpulse(
+		const FVector& OriginWorld,
+		float Radius,
+		float Strength,
+		bool bVelChange = false,
+		bool bIncludeStorage = true,
+		bool bConvertStorageToDynamic = true,
+		bool bLinearFalloff = true,
+		EPhysXInstancedQueryDebugMode DebugMode = EPhysXInstancedQueryDebugMode::None,
+		float DebugDrawDuration = 0.0f) ;
 
 	// === Per-instance physics properties ====================================
 
@@ -230,6 +311,22 @@ public:
 		UInstancedStaticMeshComponent* OptionalFilterComponent = nullptr) const;
 
 	/**
+	* Find the nearest instance with optional exclusions.
+	*
+	* Notes:
+	* - If bIncludeStorage is false, instances on storage-only actors are ignored and a valid PxRigidActor is required.
+	* - IgnoreInstanceIndex is only meaningful when OptionalFilterComponent is set (index is component-local).
+	*/
+	UFUNCTION(BlueprintCallable, Category = "Phys X Instance|Query",
+		meta = (AdvancedDisplay = "OptionalFilterComponent,IgnoreInstanceID,IgnoreInstanceIndex,bIncludeStorage"))
+	FPhysXInstanceID FindNearestInstanceAdvanced(
+		FVector WorldLocation,
+		UInstancedStaticMeshComponent* OptionalFilterComponent,
+		FPhysXInstanceID IgnoreInstanceID,
+		int32 IgnoreInstanceIndex,
+		bool bIncludeStorage) const;
+	
+	/**
 	 * Find an instance ID by its owning component and instance index.
 	 *
 	 * @return Valid ID on success, or invalid ID (UniqueID == 0) if no match is found.
@@ -239,6 +336,50 @@ public:
 		UInstancedStaticMeshComponent* InstancedMesh,
 		int32 InstanceIndex) const;
 
+	UFUNCTION(BlueprintCallable, Category = "Phys X Instance|Query",
+	meta = (AdvancedDisplay = "DebugMode,DebugDrawDuration"))
+	bool RaycastPhysXInstanceID(
+		const FVector& StartWorld,
+		const FVector& EndWorld,
+		FPhysXInstanceID& OutID,
+		EPhysXInstancedQueryDebugMode DebugMode = EPhysXInstancedQueryDebugMode::None,
+		float DebugDrawDuration = 0.0f) const;
+
+	UFUNCTION(BlueprintCallable, Category = "Phys X Instance|Query",
+		meta = (AdvancedDisplay = "bIncludeStorage,TraceChannel,DebugMode,DebugDrawDuration"))
+	bool RaycastInstanceID(
+		const FVector& StartWorld,
+		const FVector& EndWorld,
+		FPhysXInstanceID& OutID,
+		bool bIncludeStorage = true,
+		ECollisionChannel TraceChannel = ECC_Visibility,
+		EPhysXInstancedQueryDebugMode DebugMode = EPhysXInstancedQueryDebugMode::None,
+		float DebugDrawDuration = 0.0f) const;
+
+	UFUNCTION(BlueprintCallable, Category = "Phys X Instance|Query",
+		meta = (AdvancedDisplay = "bIncludeStorage,TraceChannel,DebugMode,DebugDrawDuration"))
+	bool SweepSphereInstanceID(
+		const FVector& StartWorld,
+		const FVector& EndWorld,
+		float Radius,
+		FPhysXInstanceID& OutID,
+		bool bIncludeStorage = true,
+		ECollisionChannel TraceChannel = ECC_Visibility,
+		EPhysXInstancedQueryDebugMode DebugMode = EPhysXInstancedQueryDebugMode::None,
+		float DebugDrawDuration = 0.0f) const;
+
+	UFUNCTION(BlueprintCallable, Category = "Phys X Instance|Query",
+		meta = (AdvancedDisplay = "bIncludeStorage,TraceChannel,DebugMode,DebugDrawDuration"))
+	bool OverlapSphereInstanceIDs(
+		const FVector& CenterWorld,
+		float Radius,
+		TArray<FPhysXInstanceID>& OutIDs,
+		bool bIncludeStorage = true,
+		ECollisionChannel TraceChannel = ECC_Visibility,
+		EPhysXInstancedQueryDebugMode DebugMode = EPhysXInstancedQueryDebugMode::None,
+		float DebugDrawDuration = 0.0f) const;
+
+	
 	// === Actor-level registration & query ===================================
 
 	/**
@@ -362,8 +503,62 @@ private:
 	UPROPERTY(EditAnywhere, Config, Category = "Phys X Instance|Performance", meta = (ClampMin = "0"))
 	int32 MaxAddActorsPerFrame = 64;
 
+	// === Deferred instance tasks (forces/impulses/etc) =========================
+
+	enum class EPhysXInstanceTaskType : uint8
+	{
+		AddImpulse,
+		AddForce,
+		PutToSleep,
+		WakeUp,
+	};
+
+	struct FPhysXInstanceTask
+	{
+		EPhysXInstanceTaskType Type = EPhysXInstanceTaskType::AddImpulse;
+
+		FPhysXInstanceID ID;
+
+		// Used by AddImpulse/AddForce.
+		FVector Vector = FVector::ZeroVector;
+
+		// AddImpulse: bVelChange
+		// AddForce:   bAccelChange
+		bool bModeFlag = false;
+
+		// Storage handling (matches your Advanced API semantics).
+		bool bIncludeStorage = true;
+		bool bConvertStorageToDynamic = true;
+
+		// Retry counter for "not ready yet" cases (e.g. body not in scene).
+		int32 Attempts = 0;
+	};
+
+	// Max number of instance tasks to execute per frame. 0 = no limit.
+	UPROPERTY(EditAnywhere, Config, Category = "Phys X Instance|Performance", meta = (ClampMin = "0"))
+	int32 MaxInstanceTasksPerFrame = 4096;
+
+	// FIFO queue of requested operations executed in Tick.
+	TArray<FPhysXInstanceTask> PendingInstanceTasks;
+
+	void EnqueueInstanceTask(const FPhysXInstanceTask& Task);
+	void ProcessInstanceTasks();
+
+#if PHYSICS_INTERFACE_PHYSX
+	bool TryExecuteInstanceTask(FPhysXInstanceTask& Task);
+#endif
+
 #if PHYSICS_INTERFACE_PHYSX
 
+	struct FPhysXInstanceUserData;
+
+	// One allocation per ID, owned by the subsystem (stable address).
+	TMap<FPhysXInstanceID, FPhysXInstanceUserData*> UserDataByID;
+	
+	void EnsureInstanceUserData(FPhysXInstanceID ID);
+	void ClearInstanceUserData(FPhysXInstanceID ID);
+	FPhysXInstanceID GetInstanceIDFromPxActor(const physx::PxRigidActor* Actor) const;
+	
 	// === Pending scene adds ==================================================
 
 	/** Entry describing a pending "add actor to PhysX scene" request. */
@@ -386,4 +581,56 @@ private:
 	void ProcessPendingAddActors();
 
 #endif // PHYSICS_INTERFACE_PHYSX
+	void FixInstanceIndicesAfterRemoval(UInstancedStaticMeshComponent* ISMC, int32 RemovedIndex);
+	
+	
+	
+	struct FPhysXInstanceSlotKey
+	{
+		TWeakObjectPtr<UInstancedStaticMeshComponent> Component;
+		int32 InstanceIndex = INDEX_NONE;
+
+		FPhysXInstanceSlotKey() = default;
+		FPhysXInstanceSlotKey(UInstancedStaticMeshComponent* InComp, int32 InIndex)
+			: Component(InComp), InstanceIndex(InIndex)
+		{
+		}
+
+		bool operator==(const FPhysXInstanceSlotKey& Other) const
+		{
+			return Component == Other.Component && InstanceIndex == Other.InstanceIndex;
+		}
+
+		friend uint32 GetTypeHash(const FPhysXInstanceSlotKey& Key)
+		{
+			return HashCombine(::GetTypeHash(Key.Component.Get()), ::GetTypeHash(Key.InstanceIndex));
+		}
+	};
+
+	TMap<FPhysXInstanceSlotKey, FPhysXInstanceID> InstanceIDBySlot;
+
+	void AddSlotMapping(FPhysXInstanceID ID);
+	void RemoveSlotMapping(FPhysXInstanceID ID);
+	void RebuildSlotMappingForComponent(UInstancedStaticMeshComponent* ISMC);
+	void InvalidatePendingAddEntries(FPhysXInstanceID ID);
+	
+#if PHYSICS_INTERFACE_PHYSX
+
+	bool RaycastPhysXInstanceID_Internal(
+	const FVector& StartWorld,
+	const FVector& EndWorld,
+	FPhysXInstanceID& OutID,
+	float& OutDistanceUU,
+	FVector& OutHitPosWorld,
+	FVector& OutHitNormalWorld) const;
+
+	bool SweepSpherePhysXInstanceID_Internal(
+		const FVector& StartWorld,
+		const FVector& EndWorld,
+		float Radius,
+		FPhysXInstanceID& OutID,
+		float& OutDistanceUU,
+		FVector& OutHitPosWorld,
+		FVector& OutHitNormalWorld) const;
+#endif
 };

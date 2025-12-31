@@ -376,6 +376,7 @@ void APhysXInstancedMeshActor::BeginPlay()
 	if (CachedSubsystem)
 	{
 		PhysXActorID = CachedSubsystem->RegisterInstancedMeshActor(this);
+		CachedSubsystem->ApplyActorLifetimeDefaults(this, /*bForce=*/true);
 	}
 
 	if (InstancedMesh)
@@ -1126,6 +1127,15 @@ FPhysXSpawnInstanceResult APhysXInstancedMeshActor::SpawnPhysicsInstanceFromActo
 		Request.ExplicitActor = this;
 	}
 
+	// Lifetime: propagate actor defaults as per-spawn override.
+	// This is required when the spawn ends up owned by a different actor (e.g. storage actor path).
+	if (bEnableLifetime && DefaultLifeTimeSeconds > 0.0f)
+	{
+		Request.bOverrideLifetime = true;
+		Request.LifeTimeSeconds   = DefaultLifeTimeSeconds;
+		Request.LifetimeAction    = DefaultLifetimeAction;
+	}
+
 	return Subsystem->SpawnPhysicsInstance(Request);
 }
 
@@ -1292,4 +1302,23 @@ FPhysXInstanceID APhysXInstancedMeshActor::GetInstanceIDFromSubsystemByIndex(int
 	}
 
 	return Subsystem->GetInstanceIDForComponentAndIndex(InstancedMesh, InstanceIndex);
+}
+
+int32 APhysXInstancedMeshActor::ReapplyLifetimeToRegisteredInstances(bool bForce)
+{
+	// Refresh subsystem pointer if needed.
+	if (!CachedSubsystem)
+	{
+		if (UWorld* World = GetWorld())
+		{
+			CachedSubsystem = World->GetSubsystem<UPhysXInstancedWorldSubsystem>();
+		}
+	}
+
+	if (!CachedSubsystem)
+	{
+		return 0;
+	}
+
+	return CachedSubsystem->ApplyActorLifetimeDefaults(this, bForce);
 }

@@ -8,6 +8,7 @@
 
 #include "CoreMinimal.h"
 #include "Components/InstancedStaticMeshComponent.h"
+
 #include "PhysXInstancedTypes.generated.h"
 
 namespace physx
@@ -18,10 +19,11 @@ namespace physx
 	class PxMaterial;
 }
 
+class UWorld;
 class UStaticMesh;
 class UMaterialInterface;
+class UInstancedStaticMeshComponent;
 class APhysXInstancedMeshActor;
-class UWorld;
 
 // ============================================================================
 //  Public enums / configs
@@ -127,6 +129,45 @@ enum class EPhysXInstancedQueryDebugMode : uint8
 	None     UMETA(DisplayName = "None"),
 	Basic    UMETA(DisplayName = "Basic"),
 	Detailed UMETA(DisplayName = "Detailed"),
+};
+
+UENUM(BlueprintType, meta=(Bitflags, UseEnumValuesAsMaskValuesInEditor="true"))
+enum class EPhysXInstanceEventFlags : uint8
+{
+	None        = 0,
+	PreRemove   = 1 << 0,
+	PostRemove  = 1 << 1,
+	PreConvert  = 1 << 2,
+	PostConvert = 1 << 3,
+	PrePhysics  = 1 << 4,
+	PostPhysics = 1 << 5,
+	// Add more when needed.
+};
+ENUM_CLASS_FLAGS(EPhysXInstanceEventFlags);
+
+UENUM(BlueprintType)
+enum class EPhysXInstanceRemoveReason : uint8
+{
+	Explicit,   // User called RemoveInstance
+	Expired,    // TTL
+	AutoStop,   // Auto-stop rule triggered
+	KillZ,      // Custom kill Z
+	Lost,       // Any "lost instance" logic you use
+};
+
+UENUM(BlueprintType)
+enum class EPhysXInstanceConvertReason : uint8
+{
+	Explicit,
+	AutoStop,
+	Expired,
+};
+
+UENUM(BlueprintType)
+enum class EPhysXInstanceConvertDirection : uint8
+{
+	ToStorage,
+	ToDynamic,
 };
 
 /**
@@ -250,28 +291,20 @@ public:
 	}
 
 	/** Return the raw numeric ID. */
-	uint32 GetUniqueID() const
-	{
-		return UniqueID;
-	}
+	FORCEINLINE uint32 GetUniqueID() const { return UniqueID; }
 
 	/** Set the raw numeric ID. Intended for subsystem use. */
-	void SetUniqueID(uint32 InID)
-	{
-		UniqueID = InID;
-	}
+	FORCEINLINE void SetUniqueID(uint32 InID) { UniqueID = InID; }
 
 	/** Validity check: zero means "no instance". */
-	bool IsValid() const
-	{
-		return UniqueID != 0u;
-	}
+	FORCEINLINE bool IsValid() const { return UniqueID != 0u; }
+
 
 	bool operator==(const FPhysXInstanceID& Other) const
 	{
 		return UniqueID == Other.UniqueID;
 	}
-	
+
 	bool operator!=(const FPhysXInstanceID& Other) const
 	{
 		return UniqueID != Other.UniqueID;
@@ -328,7 +361,7 @@ public:
 	{
 		return UniqueID == Other.UniqueID;
 	}
-	
+
 	bool operator!=(const FPhysXActorID& Other) const
 	{
 		return UniqueID != Other.UniqueID;
@@ -408,6 +441,23 @@ struct FPhysXSpawnInstanceRequest
 	/** Optional initial angular velocity (radians/s) in world space. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spawn")
 	FVector InitialAngularVelocityRad = FVector::ZeroVector;
+	
+	// --- Lifetime override ---------------------------------------------------
+
+	/** If true, overrides actor default lifetime settings for this spawn. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spawn|Lifetime")
+	bool bOverrideLifetime = false;
+
+	/** Lifetime in seconds starting from spawn time. 0 disables lifetime for this instance. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spawn|Lifetime",
+		meta = (ClampMin = "0.0", EditCondition = "bOverrideLifetime"))
+	float LifeTimeSeconds = 0.0f;
+
+	/** Action executed when lifetime expires (only used when bOverrideLifetime is true). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spawn|Lifetime",
+		meta = (EditCondition = "bOverrideLifetime"))
+	EPhysXInstanceStopAction LifetimeAction = EPhysXInstanceStopAction::DestroyBody;
+
 };
 
 /** Result of a SpawnPhysicsInstance() call. */
@@ -520,6 +570,23 @@ struct FPhysXInstanceData
 	float FallTime = 0.0f;
 
 	FPhysXInstanceData() = default;
+	
+	// --- Lifetime (TTL) ------------------------------------------------------
+
+	/** True if this instance has an active lifetime timer. */
+	bool bHasLifetime = false;
+
+	/** Absolute world time (GetTimeSeconds) when this instance should expire. */
+	float ExpireAt = 0.0f;
+
+	/** Action executed when the instance expires. */
+	EPhysXInstanceStopAction LifetimeAction = EPhysXInstanceStopAction::None;
+
+	/**
+	 * Monotonic serial used to invalidate stale heap entries when lifetime is updated.
+	 * Incremented each time lifetime state changes.
+	 */
+	uint32 LifetimeSerial = 0;
 };
 
 /** Runtime info about a PhysXInstancedMeshActor stored by the subsystem. */
@@ -635,5 +702,3 @@ struct FPhysXInstanceParallelResult
 	 */
 	bool bReachedMinStoppedTime = false;
 };
-
-

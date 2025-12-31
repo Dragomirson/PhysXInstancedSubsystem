@@ -17,11 +17,57 @@
 
 #include "PhysXInstancedMeshActor.generated.h"
 
+
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(
+	FPhysXInstancePreRemoveSig,
+	FPhysXInstanceID, ID,
+	EPhysXInstanceRemoveReason, Reason,
+	const FTransform&, WorldTransform);
+
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(
+	FPhysXInstancePostRemoveSig,
+	FPhysXInstanceID, ID,
+	EPhysXInstanceRemoveReason, Reason,
+	const FTransform&, WorldTransform);
+
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_FiveParams(
+	FPhysXInstancePreConvertSig,
+	FPhysXInstanceID, ID,
+	EPhysXInstanceConvertReason, Reason,
+	APhysXInstancedMeshActor*, FromActor,
+	APhysXInstancedMeshActor*, ToActor,
+	const FTransform&, WorldTransform);
+
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_FiveParams(
+	FPhysXInstancePostConvertSig,
+	FPhysXInstanceID, ID,
+	EPhysXInstanceConvertReason, Reason,
+	APhysXInstancedMeshActor*, FromActor,
+	APhysXInstancedMeshActor*, ToActor,
+	const FTransform&, WorldTransform);
+
+
+
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(
+	FPhysXInstancePrePhysicsEventSig,
+	FPhysXInstanceID, ID,
+	bool, bEnable,
+	bool, bDestroyBodyIfDisabling);
+
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_FourParams(
+	FPhysXInstancePostPhysicsEventSig,
+	FPhysXInstanceID, ID,
+	bool, bEnable,
+	bool, bDestroyBodyIfDisabling,
+	bool, bSuccess);
+
 class USceneComponent;
 class UStaticMesh;
 class UMaterialInterface;
 class UPhysXInstancedStaticMeshComponent;
 class UPhysXInstancedWorldSubsystem;
+class APhysXInstancedMeshActor;
+
 struct FPropertyChangedEvent;
 
 /** How instance transforms are generated for this actor. */
@@ -41,26 +87,8 @@ enum class EPhysXInstanceSpawnMode : uint8
  *  - Optionally registers instances in the PhysX instanced subsystem on BeginPlay.
  *  - Exposes runtime Blueprint API to query and control instance physics.
  */
-UCLASS(
-	ClassGroup = (PhysX),
-	BlueprintType,
-	Blueprintable,
-	hideCategories = (
-		Input,
-		Replication,
-		Actor,
-		Tags,
-		Activation,
-		Instances,
-		Physics,
-		LOD,
-		Cooking,
-		HLOD,
-		WorldPartition,
-		DataLayers
-	),
-	showCategories = ("Rendering", "Phys X Instance")
-)
+UCLASS(ClassGroup = (PhysX),BlueprintType,Blueprintable,hideCategories = (Input,Replication,Actor,Tags,Activation,Instances,Physics,LOD,Cooking,HLOD,WorldPartition,DataLayers),showCategories = ("Rendering", "Phys X Instance"))
+
 class APhysXInstancedMeshActor : public AActor
 {
 	GENERATED_BODY()
@@ -76,6 +104,28 @@ public:
 	UPROPERTY()
 	class UBillboardComponent* PhysXBillboard = nullptr;
 #endif
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="PhysX Instance|Events",
+	meta=(Bitmask, BitmaskEnum="EPhysXInstanceEventFlags", UseEnumValuesAsMaskValuesInEditor="true"))
+	int32 InstanceEventMask = 0;
+
+
+	UPROPERTY(BlueprintAssignable, Category="PhysX Instance|Events")
+	FPhysXInstancePreRemoveSig OnInstancePreRemove;
+
+	UPROPERTY(BlueprintAssignable, Category="PhysX Instance|Events")
+	FPhysXInstancePostRemoveSig OnInstancePostRemove;
+	
+	UPROPERTY(BlueprintAssignable, Category="PhysX Instance|Events")
+	FPhysXInstancePreConvertSig OnInstancePreConvert;
+
+	UPROPERTY(BlueprintAssignable, Category="PhysX Instance|Events")
+	FPhysXInstancePostConvertSig OnInstancePostConvert;
+
+	UPROPERTY(BlueprintAssignable, Category="PhysX Instance|Events")
+	FPhysXInstancePrePhysicsEventSig OnInstancePrePhysics;
+
+	UPROPERTY(BlueprintAssignable, Category="PhysX Instance|Events")
+	FPhysXInstancePostPhysicsEventSig OnInstancePostPhysics;
 
 	// === Components ==========================================================
 
@@ -193,6 +243,23 @@ public:
 	UPROPERTY(EditAnywhere, Category = "Phys X Instance", meta = (ClampMin = "0.0"))
 	float InstanceAngularDamping;
 
+	// --- Lifetime (TTL) ------------------------------------------------------
+
+	/** Enable lifetime expiration for newly spawned instances. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "PhysX Instance|Lifetime")
+	bool bEnableLifetime = false;
+
+	/** Default lifetime (seconds) for instances spawned on this actor. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "PhysX Instance|Lifetime",
+		meta = (ClampMin = "0.0", EditCondition = "bEnableLifetime"))
+	float DefaultLifeTimeSeconds = 10.0f;
+
+	/** Action executed when an instance lifetime expires. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "PhysX Instance|Lifetime",
+		meta = (EditCondition = "bEnableLifetime"))
+	EPhysXInstanceStopAction DefaultLifetimeAction = EPhysXInstanceStopAction::DestroyBody;
+
+	
 	/**
 	 * If true, this actor is used only as a static storage of ISM instances
 	 * and does not create PhysX bodies.
@@ -488,4 +555,11 @@ protected:
 	 */
 	UPROPERTY(Transient)
 	TArray<FPhysXInstanceID> RegisteredInstanceIDs;
+	
+	// --- Lifetime (TTL) -------------------------------------------------------
+
+	/** Re-apply current lifetime settings to already registered instances. */
+	UFUNCTION(BlueprintCallable, Category = "PhysX Instance|Lifetime")
+	int32 ReapplyLifetimeToRegisteredInstances(bool bForce = true);
+
 };

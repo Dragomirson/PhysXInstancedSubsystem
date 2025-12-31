@@ -1,44 +1,55 @@
 ﻿/**
-* Copyright (C) 2025 | Created by NordVader Inc.
-* All rights reserved!
-* My Discord Server: https://discord.gg/B8prpf3vzD
-*/
+ * Copyright (C) 2025 | Created by NordVader Inc.
+ * All rights reserved!
+ * My Discord Server: https://discord.gg/B8prpf3vzD
+ */
 
 #include "Subsystems/PhysXInstancedWorldSubsystem.h"
+
+// Plugin
 #include "Actors/PhysXInstancedMeshActor.h"
 #include "Components/PhysXInstancedStaticMeshComponent.h"
 #include "Debug/PhysXInstancedStats.h"
 #include "PhysXInstancedBody.h"
+#include "Processes/PhysXInstancedDefaultProcesses.h"
+#include "Processes/PhysXInstancedProcessPipeline.h"
+#include "Types/PhysXInstanceEvents.h"
 #include "Types/PhysXInstancedTypes.h"
 
+// UE
 #include "Async/ParallelFor.h"
 #include "Components/InstancedStaticMeshComponent.h"
+#include "DrawDebugHelpers.h"
 #include "Engine/StaticMesh.h"
 #include "Engine/World.h"
-#include "DrawDebugHelpers.h"
+#include "PhysicsEngine/PhysicsSettings.h"
 
+// PhysX support glue
+#include "Misc/ScopeExit.h"
 #include "PhysXInstancedSubsystem/Public/PhysXSupportCore.h"
 
 #if PHYSICS_INTERFACE_PHYSX
+	#include "Debug/PhysXInstancedDebugDraw.h"
+	#include "PhysXIncludes.h"
+#include "PxRigidBodyExt.h" // PhysX extensions: setMassAndUpdateInertia
 
-#include "Debug/PhysXInstancedDebugDraw.h"
-#include "PhysXIncludes.h"
+	#if __has_include("PhysXPublicCore.h")
+		#include "PhysXPublicCore.h"
+	#else
+		#include "PhysXPublic.h"
+	#endif
 
-#if __has_include("PhysXPublicCore.h")
-	#include "PhysXPublicCore.h"
-#else
-	#include "PhysXPublic.h"
-#endif
+	using namespace physx;
 
-using namespace physx;
-
-#if PHYSICS_INTERFACE_PHYSX
+	// Single shared material (module-wide) with a refcount to survive multiple UWorlds in editor.
+	static PxMaterial* GInstancedDefaultMaterial = nullptr;
+	static int32       GInstancedDefaultMaterialRefCount = 0;
 
 struct UPhysXInstancedWorldSubsystem::FPhysXInstanceUserData
 {
 	static constexpr uint32 MagicValue = 0x50584944; // 'PXID'
 
-	uint32          Magic      = MagicValue;
+	uint32           Magic = MagicValue;
 	FPhysXInstanceID InstanceID;
 };
 
@@ -114,14 +125,9 @@ FPhysXInstanceID UPhysXInstancedWorldSubsystem::GetInstanceIDFromPxActor(const p
 	return UD->InstanceID;
 }
 
-#endif // PHYSICS_INTERFACE_PHYSX
-
 // ============================================================================
 // PhysX globals / console variables
 // ============================================================================
-
-// Single shared material for all instanced bodies in this world.
-static PxMaterial* GInstancedDefaultMaterial = nullptr;
 
 // Toggle for using ParallelFor in AsyncPhysicsStep.
 static TAutoConsoleVariable<int32> CVarPhysXInstancedUseParallelStep(
@@ -156,146 +162,250 @@ namespace
 {
 #if ENABLE_DRAW_DEBUG
 
-	static bool IsDebugEnabled(EPhysXInstancedQueryDebugMode Mode)
-	{
-		return Mode != EPhysXInstancedQueryDebugMode::None;
-	}
-
-	// Duration semantics:
-	//  - Duration <= 0 : draw infinitely (persistent)
-	//  - Duration > 0  : draw for Duration seconds (non-persistent + lifetime)
-	static void MakeDebugDrawParams(float Duration, bool& OutPersistentLines, float& OutLifeTime, float& OutStringDuration)
-	{
-		if (Duration <= 0.0f)
-		{
-			OutPersistentLines = true;
-			OutLifeTime        = 0.0f;  // persistent forever for primitives
-			OutStringDuration  = -1.0f; // negative duration => persistent debug string
-		}
-		else
-		{
-			OutPersistentLines = false;
-			OutLifeTime        = Duration;
-			OutStringDuration  = Duration;
-		}
-	}
-
-	static void DrawLineSafe(UWorld* World, const FVector& A, const FVector& B, const FColor& Color, float Duration, float Thickness = 1.5f)
-	{
-		if (!World) return;
-
-		bool  bPersistent = false;
-		float LifeTime = 0.0f;
-		float StringDuration = 0.0f;
-		MakeDebugDrawParams(Duration, bPersistent, LifeTime, StringDuration);
-
-		DrawDebugLine(World, A, B, Color, bPersistent, LifeTime, 0, Thickness);
-	}
-
-	static void DrawPointSafe(UWorld* World, const FVector& P, const FColor& Color, float Duration, float Size = 12.0f)
-	{
-		if (!World) return;
-
-		bool  bPersistent = false;
-		float LifeTime = 0.0f;
-		float StringDuration = 0.0f;
-		MakeDebugDrawParams(Duration, bPersistent, LifeTime, StringDuration);
-
-		DrawDebugPoint(World, P, Size, Color, bPersistent, LifeTime, 0);
-	}
-
-	static void DrawSphereSafe(UWorld* World, const FVector& C, float R, const FColor& Color, float Duration, float Thickness = 1.0f)
-	{
-		if (!World) return;
-
-		bool  bPersistent = false;
-		float LifeTime = 0.0f;
-		float StringDuration = 0.0f;
-		MakeDebugDrawParams(Duration, bPersistent, LifeTime, StringDuration);
-
-		DrawDebugSphere(World, C, R, 16, Color, bPersistent, LifeTime, 0, Thickness);
-	}
-
-	static void DrawArrowSafe(UWorld* World, const FVector& From, const FVector& To, const FColor& Color, float Duration, float Thickness = 1.5f)
-	{
-		if (!World) return;
-
-		bool  bPersistent = false;
-		float LifeTime = 0.0f;
-		float StringDuration = 0.0f;
-		MakeDebugDrawParams(Duration, bPersistent, LifeTime, StringDuration);
-
-		DrawDebugDirectionalArrow(World, From, To, 12.0f, Color, bPersistent, LifeTime, 0, Thickness);
-	}
-
-	static void DrawTextSafe(UWorld* World, const FVector& At, const FString& Text, const FColor& Color, float Duration)
-	{
-		if (!World) return;
-
-		bool  bPersistent = false;
-		float LifeTime = 0.0f;
-		float StringDuration = 0.0f;
-		MakeDebugDrawParams(Duration, bPersistent, LifeTime, StringDuration);
-
-		// Note: DrawDebugString does not use bPersistentLines; it relies on Duration.
-		// We treat Duration <= 0 as "infinite" by passing negative duration.
-		DrawDebugString(World, At, Text, nullptr, Color, StringDuration, /*bDrawShadow=*/true);
-	}
-
-#endif // ENABLE_DRAW_DEBUG
-} // namespace
-
-namespace
+static bool IsDebugEnabled(EPhysXInstancedQueryDebugMode Mode)
 {
-	static bool IsOwnerStorageActor(const UInstancedStaticMeshComponent* ISMC)
+	return Mode != EPhysXInstancedQueryDebugMode::None;
+}
+
+// Duration semantics:
+//  - Duration <= 0 : draw infinitely (persistent)
+//  - Duration > 0  : draw for Duration seconds (non-persistent + lifetime)
+static void MakeDebugDrawParams(float Duration, bool& OutPersistentLines, float& OutLifeTime, float& OutStringDuration)
+{
+	if (Duration <= 0.0f)
 	{
-		if (!ISMC)
-		{
-			return false;
-		}
-
-		if (const AActor* Owner = ISMC->GetOwner())
-		{
-			if (const APhysXInstancedMeshActor* PhysXActor = Cast<APhysXInstancedMeshActor>(Owner))
-			{
-				return (PhysXActor->bIsStorageActor || PhysXActor->bStorageOnly);
-			}
-		}
-
-		return false;
+		OutPersistentLines = true;
+		OutLifeTime        = 0.0f;  // persistent forever for primitives
+		OutStringDuration  = -1.0f; // negative duration => persistent debug string
 	}
-
-	static bool GetInstanceWorldLocation_Safe(
-		const FPhysXInstanceData& Data,
-		FVector& OutLocation)
+	else
 	{
-		OutLocation = FVector::ZeroVector;
-
-		UInstancedStaticMeshComponent* ISMC = Data.InstancedComponent.Get();
-		if (!ISMC || !ISMC->IsValidLowLevelFast() || Data.InstanceIndex == INDEX_NONE)
-		{
-			return false;
-		}
-
-#if PHYSICS_INTERFACE_PHYSX
-		if (physx::PxRigidActor* RA = Data.Body.GetPxActor())
-		{
-			const physx::PxTransform PxPose = RA->getGlobalPose();
-			OutLocation = P2UVector(PxPose.p);
-			return true;
-		}
-#endif
-
-		FTransform TM;
-		if (ISMC->GetInstanceTransform(Data.InstanceIndex, TM, /*bWorldSpace=*/true))
-		{
-			OutLocation = TM.GetLocation();
-			return true;
-		}
-
-		return false;
+		OutPersistentLines = false;
+		OutLifeTime        = Duration;
+		OutStringDuration  = Duration;
 	}
 }
+
+static void DrawLineSafe(UWorld* World, const FVector& A, const FVector& B, const FColor& Color, float Duration, float Thickness = 1.5f)
+{
+	if (!World)
+	{
+		return;
+	}
+
+	bool  bPersistent = false;
+	float LifeTime = 0.0f;
+	float StringDuration = 0.0f;
+	MakeDebugDrawParams(Duration, bPersistent, LifeTime, StringDuration);
+
+	DrawDebugLine(World, A, B, Color, bPersistent, LifeTime, 0, Thickness);
+}
+
+static void DrawPointSafe(UWorld* World, const FVector& P, const FColor& Color, float Duration, float Size = 12.0f)
+{
+	if (!World)
+	{
+		return;
+	}
+
+	bool  bPersistent = false;
+	float LifeTime = 0.0f;
+	float StringDuration = 0.0f;
+	MakeDebugDrawParams(Duration, bPersistent, LifeTime, StringDuration);
+
+	DrawDebugPoint(World, P, Size, Color, bPersistent, LifeTime, 0);
+}
+
+static void DrawSphereSafe(UWorld* World, const FVector& C, float R, const FColor& Color, float Duration, float Thickness = 1.0f)
+{
+	if (!World)
+	{
+		return;
+	}
+
+	bool  bPersistent = false;
+	float LifeTime = 0.0f;
+	float StringDuration = 0.0f;
+	MakeDebugDrawParams(Duration, bPersistent, LifeTime, StringDuration);
+
+	DrawDebugSphere(World, C, R, 16, Color, bPersistent, LifeTime, 0, Thickness);
+}
+
+static void DrawArrowSafe(UWorld* World, const FVector& From, const FVector& To, const FColor& Color, float Duration, float Thickness = 1.5f)
+{
+	if (!World)
+	{
+		return;
+	}
+
+	bool  bPersistent = false;
+	float LifeTime = 0.0f;
+	float StringDuration = 0.0f;
+	MakeDebugDrawParams(Duration, bPersistent, LifeTime, StringDuration);
+
+	DrawDebugDirectionalArrow(World, From, To, 12.0f, Color, bPersistent, LifeTime, 0, Thickness);
+}
+
+static void DrawTextSafe(UWorld* World, const FVector& At, const FString& Text, const FColor& Color, float Duration)
+{
+	if (!World)
+	{
+		return;
+	}
+
+	bool  bPersistent = false;
+	float LifeTime = 0.0f;
+	float StringDuration = 0.0f;
+	MakeDebugDrawParams(Duration, bPersistent, LifeTime, StringDuration);
+
+	// Note: DrawDebugString does not use bPersistentLines; it relies on Duration.
+	// We treat Duration <= 0 as "infinite" by passing negative duration.
+	DrawDebugString(World, At, Text, nullptr, Color, StringDuration, /*bDrawShadow=*/true);
+}
+
+#endif // ENABLE_DRAW_DEBUG
+
+static bool IsOwnerStorageActor(const UInstancedStaticMeshComponent* ISMC)
+{
+	if (!ISMC)
+	{
+		return false;
+	}
+
+	if (const AActor* Owner = ISMC->GetOwner())
+	{
+		if (const APhysXInstancedMeshActor* PhysXActor = Cast<APhysXInstancedMeshActor>(Owner))
+		{
+			return (PhysXActor->bIsStorageActor || PhysXActor->bStorageOnly);
+		}
+	}
+
+	return false;
+}
+
+static bool IsEventEnabled(const APhysXInstancedMeshActor* Owner, EPhysXInstanceEventFlags Flag)
+{
+	return Owner
+		&& Owner->InstanceEventMask != 0
+		&& ((Owner->InstanceEventMask & (int32)Flag) != 0);
+}
+
+static bool HasInterfaceEvents(const APhysXInstancedMeshActor* Owner)
+{
+	return Owner
+		&& Owner->GetClass()->ImplementsInterface(UPhysXInstanceEvents::StaticClass());
+}
+	
+static bool GetInstanceWorldTransform_Safe(const FPhysXInstanceData& Data, FTransform& OutWorldTM)
+{
+	OutWorldTM = FTransform::Identity;
+
+#if PHYSICS_INTERFACE_PHYSX
+	if (physx::PxRigidActor* RA = Data.Body.GetPxActor())
+	{
+		const physx::PxTransform PxPose = RA->getGlobalPose();
+		OutWorldTM = FTransform(P2UQuat(PxPose.q), P2UVector(PxPose.p), FVector::OneVector);
+		return true;
+	}
+#endif
+
+	UInstancedStaticMeshComponent* ISMC = Data.InstancedComponent.Get();
+	if (!ISMC || !ISMC->IsValidLowLevelFast() || Data.InstanceIndex == INDEX_NONE)
+	{
+		return false;
+	}
+
+	return ISMC->GetInstanceTransform(Data.InstanceIndex, OutWorldTM, /*bWorldSpace=*/true);
+}
+
+static bool GetInstanceWorldLocation_Safe(const FPhysXInstanceData& Data, FVector& OutLocation)
+{
+	OutLocation = FVector::ZeroVector;
+
+	UInstancedStaticMeshComponent* ISMC = Data.InstancedComponent.Get();
+	if (!ISMC || !ISMC->IsValidLowLevelFast() || Data.InstanceIndex == INDEX_NONE)
+	{
+		return false;
+	}
+
+#if PHYSICS_INTERFACE_PHYSX
+	if (physx::PxRigidActor* RA = Data.Body.GetPxActor())
+	{
+		const physx::PxTransform PxPose = RA->getGlobalPose();
+		OutLocation = P2UVector(PxPose.p);
+		return true;
+	}
+#endif
+
+	FTransform TM;
+	if (ISMC->GetInstanceTransform(Data.InstanceIndex, TM, /*bWorldSpace=*/true))
+	{
+		OutLocation = TM.GetLocation();
+		return true;
+	}
+
+	return false;
+}
+
+	static void FirePrePhysics(
+	APhysXInstancedMeshActor* Owner,
+	FPhysXInstanceID ID,
+	bool bEnable,
+	bool bDestroyBodyIfDisabling)
+{
+	if (!IsValid(Owner))
+	{
+		return;
+	}
+
+	const bool bWants =
+		IsEventEnabled(Owner, EPhysXInstanceEventFlags::PrePhysics) &&
+		(Owner->OnInstancePrePhysics.IsBound() || HasInterfaceEvents(Owner));
+
+	if (!bWants)
+	{
+		return;
+	}
+
+	Owner->OnInstancePrePhysics.Broadcast(ID, bEnable, bDestroyBodyIfDisabling);
+
+	if (HasInterfaceEvents(Owner))
+	{
+		IPhysXInstanceEvents::Execute_OnInstancePrePhysics(Owner, ID, bEnable, bDestroyBodyIfDisabling);
+	}
+}
+
+	static void FirePostPhysics(
+		APhysXInstancedMeshActor* Owner,
+		FPhysXInstanceID ID,
+		bool bEnable,
+		bool bDestroyBodyIfDisabling,
+		bool bSuccess)
+{
+	if (!IsValid(Owner))
+	{
+		return;
+	}
+
+	const bool bWants =
+		IsEventEnabled(Owner, EPhysXInstanceEventFlags::PostPhysics) &&
+		(Owner->OnInstancePostPhysics.IsBound() || HasInterfaceEvents(Owner));
+
+	if (!bWants)
+	{
+		return;
+	}
+
+	Owner->OnInstancePostPhysics.Broadcast(ID, bEnable, bDestroyBodyIfDisabling, bSuccess);
+
+	if (HasInterfaceEvents(Owner))
+	{
+		IPhysXInstanceEvents::Execute_OnInstancePostPhysics(Owner, ID, bEnable, bDestroyBodyIfDisabling, bSuccess);
+	}
+}
+
+} // namespace
+
 
 // ============================================================================
 // Constructor
@@ -309,6 +419,203 @@ UPhysXInstancedWorldSubsystem::UPhysXInstancedWorldSubsystem()
 	NumBodiesSleeping   = 0;
 }
 
+UPhysXInstancedWorldSubsystem::~UPhysXInstancedWorldSubsystem()
+{
+	ProcessManager.Reset();
+}
+
+void UPhysXInstancedWorldSubsystem::BuildProcessPipeline()
+{
+	if (!ProcessManager.IsValid())
+	{
+		ProcessManager = MakeUnique<FPhysXISProcessManager>();
+	}
+
+	ProcessManager->Reset();
+
+	PhysXIS::RegisterDefaultProcesses(*ProcessManager);
+
+	FPhysXISProcessContext Ctx;
+	Ctx.Subsystem = this;
+	Ctx.World     = CachedWorld.Get() ? CachedWorld.Get() : GetWorld();
+	Ctx.DeltaTime = 0.f;
+	Ctx.SimTime   = 0.f;
+
+	ProcessManager->InitializeAll(Ctx);
+}
+
+// ============================================================================
+// Stop actions shared by async-step and lifetime (TTL)
+// ============================================================================
+
+static_assert((int32)EPhysXInstanceStopAction::None == 0, "EPhysXInstanceStopAction order changed.");
+static_assert((int32)EPhysXInstanceStopAction::ConvertToStorage == 4, "EPhysXInstanceStopAction order changed.");
+
+bool UPhysXInstancedWorldSubsystem::HandleStopAction_None(
+	FPhysXInstanceID ID,
+	const FStopActionExecOptions& Opt,
+	FPhysXInstanceData& Data)
+{
+	return true;
+}
+
+bool UPhysXInstancedWorldSubsystem::HandleStopAction_DisableSimulation(
+	FPhysXInstanceID ID,
+	const FStopActionExecOptions& Opt,
+	FPhysXInstanceData& Data)
+{
+	if (Opt.bUseSetInstancePhysicsEnabled)
+	{
+		return SetInstancePhysicsEnabled(ID, /*bEnable=*/false, /*bDestroyBodyIfDisabling=*/false);
+	}
+
+#if PHYSICS_INTERFACE_PHYSX
+	if (physx::PxRigidActor* Actor = Data.Body.GetPxActor())
+	{
+		if (physx::PxRigidDynamic* RD = Actor->is<physx::PxRigidDynamic>())
+		{
+			RD->setRigidBodyFlag(PxRigidBodyFlag::eKINEMATIC, true);
+			RD->setActorFlag(PxActorFlag::eDISABLE_SIMULATION, true);
+		}
+	}
+#endif
+
+	Data.bSimulating = false;
+	return true;
+}
+
+bool UPhysXInstancedWorldSubsystem::HandleStopAction_DestroyBody(
+	FPhysXInstanceID ID,
+	const FStopActionExecOptions& Opt,
+	FPhysXInstanceData& Data)
+{
+	if (Opt.bUseSetInstancePhysicsEnabled)
+	{
+		return SetInstancePhysicsEnabled(ID, /*bEnable=*/false, /*bDestroyBodyIfDisabling=*/true);
+	}
+
+#if PHYSICS_INTERFACE_PHYSX
+	// IMPORTANT(PXIS_DEFERRED_ADD):
+	// This instance might still be queued in PendingAddActors for deferred scene insertion.
+	// If we destroy the body without invalidating the queue, ProcessPendingAddActors() may call
+	// AddActorToScene() on a destroyed/rebound body -> crash or undefined behavior.
+	InvalidatePendingAddEntries(ID);
+
+	ClearInstanceUserData(ID);
+	Data.Body.Destroy();
+#endif
+
+	Data.bSimulating = false;
+	return true;
+}
+
+bool UPhysXInstancedWorldSubsystem::HandleStopAction_DestroyBodyAndRemoveInstance(
+	FPhysXInstanceID ID,
+	const FStopActionExecOptions& Opt,
+	FPhysXInstanceData& Data)
+{
+	RemoveInstanceByID_Internal(ID, Opt.bRemoveVisualInstance, Opt.RemoveReason);
+	return false;
+}
+
+bool UPhysXInstancedWorldSubsystem::HandleStopAction_ConvertToStorage(
+	FPhysXInstanceID ID,
+	const FStopActionExecOptions& Opt,
+	FPhysXInstanceData& Data)
+{
+	const FPhysXInstanceData* Current = Instances.Find(ID);
+	UInstancedStaticMeshComponent* ISMC = Current ? Current->InstancedComponent.Get() : nullptr;
+	const APhysXInstancedMeshActor* OwnerActor = ISMC ? Cast<APhysXInstancedMeshActor>(ISMC->GetOwner()) : nullptr;
+	const bool bAlreadyStorage = OwnerActor && (OwnerActor->bIsStorageActor || OwnerActor->bStorageOnly);
+
+	if (!bAlreadyStorage)
+	{
+		const EPhysXInstanceConvertReason ConvertReason = ConvertReasonFromRemoveReason(Opt.RemoveReason);
+
+		if (ConvertInstanceToStaticStorage_Internal(ID, Opt.bCreateStorageActorIfNeeded, ConvertReason))
+		{
+			if (FPhysXInstanceData* After = Instances.Find(ID))
+			{
+				After->bSimulating = false;
+			}
+			return true;
+		}
+
+		if (Opt.bDestroyBodyOnConvertFailure)
+		{
+#if PHYSICS_INTERFACE_PHYSX
+			// IMPORTANT(PXIS_DEFERRED_ADD): see comment in HandleStopAction_DestroyBody().
+			InvalidatePendingAddEntries(ID);
+			
+			ClearInstanceUserData(ID);
+			Data.Body.Destroy();
+#endif
+			Data.bSimulating = false;
+		}
+	}
+
+	return true;
+}
+
+#if PHYSICS_INTERFACE_PHYSX
+
+bool UPhysXInstancedWorldSubsystem::HandleInstanceTask_AddImpulse(FPhysXInstanceTask& Task, physx::PxRigidDynamic* RD)
+{
+	if (!RD)
+	{
+		return false;
+	}
+
+	const physx::PxVec3 PxImpulse = U2PVector(Task.Vector);
+	const physx::PxForceMode::Enum Mode = Task.bModeFlag
+		? physx::PxForceMode::eVELOCITY_CHANGE
+		: physx::PxForceMode::eIMPULSE;
+
+	RD->addForce(PxImpulse, Mode, /*autowake=*/true);
+	return true;
+}
+
+bool UPhysXInstancedWorldSubsystem::HandleInstanceTask_AddForce(FPhysXInstanceTask& Task, physx::PxRigidDynamic* RD)
+{
+	if (!RD)
+	{
+		return false;
+	}
+
+	const physx::PxVec3 PxForce = U2PVector(Task.Vector);
+	const physx::PxForceMode::Enum Mode = Task.bModeFlag
+		? physx::PxForceMode::eACCELERATION
+		: physx::PxForceMode::eFORCE;
+
+	RD->addForce(PxForce, Mode, /*autowake=*/true);
+	return true;
+}
+
+bool UPhysXInstancedWorldSubsystem::HandleInstanceTask_PutToSleep(FPhysXInstanceTask& Task, physx::PxRigidDynamic* RD)
+{
+	if (!RD)
+	{
+		return false;
+	}
+
+	RD->putToSleep();
+	return true;
+}
+
+bool UPhysXInstancedWorldSubsystem::HandleInstanceTask_WakeUp(FPhysXInstanceTask& Task, physx::PxRigidDynamic* RD)
+{
+	if (!RD)
+	{
+		return false;
+	}
+
+	RD->wakeUp();
+	return true;
+}
+
+
+#endif // PHYSICS_INTERFACE_PHYSX
+
 // ============================================================================
 // UWorldSubsystem interface
 // ============================================================================
@@ -318,9 +625,17 @@ void UPhysXInstancedWorldSubsystem::Initialize(FSubsystemCollectionBase& Collect
 	Super::Initialize(Collection);
 
 	CachedWorld = GetWorld();
-	
+
+	// Reset runtime state.
+	LifetimeHeap.Reset();
+
+	PendingInstanceTasks.Reset();
+	InstanceIDBySlot.Reset();
+
+#if PHYSICS_INTERFACE_PHYSX
 	PendingAddActorsHead = 0;
 	PendingAddActors.Reset();
+#endif
 
 	Instances.Reset();
 	NextID = 1;
@@ -329,31 +644,44 @@ void UPhysXInstancedWorldSubsystem::Initialize(FSubsystemCollectionBase& Collect
 	NextActorID = 1;
 
 	NumBodiesLifetimeCreated = 0;
+	NumBodiesTotal           = 0;
+	NumBodiesSimulating      = 0;
+	NumBodiesSleeping        = 0;
 
 #if PHYSICS_INTERFACE_PHYSX
-	// Create one default material for the whole lifetime of this subsystem.
-	if (GPhysXSDK && !GInstancedDefaultMaterial)
+	// Create one default material shared across worlds; keep it alive via refcount.
+	if (GPhysXSDK)
 	{
-		const PxReal StaticFriction  = 0.6f;
-		const PxReal DynamicFriction = 0.6f;
-		const PxReal Restitution     = 0.1f;
+		if (!GInstancedDefaultMaterial)
+		{
+			const PxReal StaticFriction  = 0.6f;
+			const PxReal DynamicFriction = 0.6f;
+			const PxReal Restitution     = 0.1f;
 
-		GInstancedDefaultMaterial = GPhysXSDK->createMaterial(
-			StaticFriction,
-			DynamicFriction,
-			Restitution);
+			GInstancedDefaultMaterial = GPhysXSDK->createMaterial(
+				StaticFriction,
+				DynamicFriction,
+				Restitution);
+		}
+
+		if (GInstancedDefaultMaterial)
+		{
+			++GInstancedDefaultMaterialRefCount;
+		}
 	}
 #endif // PHYSICS_INTERFACE_PHYSX
+	BuildProcessPipeline();
 }
 
 void UPhysXInstancedWorldSubsystem::Deinitialize()
 {
-	CachedWorld.Reset();
-	
-	PendingAddActorsHead = 0;
-	PendingAddActors.Reset();
+	// Stop any deferred work first.
+	PendingInstanceTasks.Reset();
+	LifetimeHeap.Reset();
 
 #if PHYSICS_INTERFACE_PHYSX
+	PendingAddActorsHead = 0;
+	PendingAddActors.Reset();
 
 	for (TPair<FPhysXInstanceID, FPhysXInstanceData>& Pair : Instances)
 	{
@@ -361,16 +689,36 @@ void UPhysXInstancedWorldSubsystem::Deinitialize()
 		Pair.Value.Body.Destroy();
 	}
 
+	UserDataByID.Reset();
 
-	// Release the shared material.
+	// Release shared material only when the last world subsystem goes away.
 	if (GInstancedDefaultMaterial)
 	{
-		GInstancedDefaultMaterial->release();
-		GInstancedDefaultMaterial = nullptr;
+		GInstancedDefaultMaterialRefCount = FMath::Max(0, GInstancedDefaultMaterialRefCount - 1);
+		if (GInstancedDefaultMaterialRefCount == 0)
+		{
+			GInstancedDefaultMaterial->release();
+			GInstancedDefaultMaterial = nullptr;
+		}
 	}
 #endif // PHYSICS_INTERFACE_PHYSX
 
 	Instances.Reset();
+	Actors.Reset();
+	InstanceIDBySlot.Reset();
+	CachedWorld.Reset();
+
+	if (ProcessManager.IsValid())
+	{
+		FPhysXISProcessContext Ctx;
+		Ctx.Subsystem = this;
+		Ctx.World     = CachedWorld.Get() ? CachedWorld.Get() : GetWorld();
+		Ctx.DeltaTime = 0.f;
+		Ctx.SimTime   = 0.f;
+
+		ProcessManager->DeinitializeAll(Ctx);
+		ProcessManager.Reset();
+	}
 
 	Super::Deinitialize();
 }
@@ -383,18 +731,299 @@ void UPhysXInstancedWorldSubsystem::Tick(float DeltaTime)
 {
 	Super::Tick(DeltaTime);
 
+	float SimTime = DeltaTime;
+	if (const UPhysicsSettings* PhysSettings = UPhysicsSettings::Get())
+	{
+		const float MaxPhysDt = PhysSettings->MaxPhysicsDeltaTime;
+		if (MaxPhysDt > 0.0f)
+		{
+			SimTime = FMath::Min(SimTime, MaxPhysDt);
+		}
+	}
+	SimTime = FMath::Max(0.0f, SimTime);
+
+	if (!ProcessManager.IsValid())
+	{
+		BuildProcessPipeline();
+	}
+
+	if (ProcessManager.IsValid())
+	{
+		FPhysXISProcessContext Ctx;
+		Ctx.Subsystem = this;
+		Ctx.World     = CachedWorld.Get() ? CachedWorld.Get() : GetWorld();
+		Ctx.DeltaTime = DeltaTime;
+		Ctx.SimTime   = SimTime;
+
+		ProcessManager->TickAll(Ctx);
+		return;
+	}
+
 #if PHYSICS_INTERFACE_PHYSX
 	ProcessPendingAddActors();
 	ProcessInstanceTasks();
 #endif
 
-	AsyncPhysicsStep(DeltaTime, DeltaTime);
+	AsyncPhysicsStep(DeltaTime, SimTime);
+	ProcessLifetimeExpirations();
 }
 
 TStatId UPhysXInstancedWorldSubsystem::GetStatId() const
 {
 	RETURN_QUICK_DECLARE_CYCLE_STAT(UPhysXInstancedSubsystem, STATGROUP_Tickables);
 }
+
+// ============================================================================
+// Lifetime (TTL)
+// ============================================================================
+
+int32 UPhysXInstancedWorldSubsystem::ApplyActorLifetimeDefaults(APhysXInstancedMeshActor* Actor, bool bForce)
+{
+	if (!Actor)
+	{
+		return 0;
+	}
+
+	const float Now = GetWorldTimeSecondsSafe();
+
+	const bool bEnable = Actor->bEnableLifetime && (Actor->DefaultLifeTimeSeconds > 0.0f);
+	const float LifetimeSeconds = Actor->DefaultLifeTimeSeconds;
+	const EPhysXInstanceStopAction Action = Actor->DefaultLifetimeAction;
+
+	int32 Updated = 0;
+
+	for (const FPhysXInstanceID& ID : Actor->RegisteredInstanceIDs)
+	{
+		if (!ID.IsValid())
+		{
+			continue;
+		}
+
+		FPhysXInstanceData* Data = Instances.Find(ID);
+		if (!Data)
+		{
+			continue;
+		}
+
+		if (bEnable)
+		{
+			if (bForce || !Data->bHasLifetime)
+			{
+				SetInstanceLifetime_Internal(ID, Now, LifetimeSeconds, Action);
+				++Updated;
+			}
+		}
+		else
+		{
+			if (bForce || Data->bHasLifetime)
+			{
+				DisableInstanceLifetime_Internal(ID);
+				++Updated;
+			}
+		}
+	}
+
+	return Updated;
+}
+
+void UPhysXInstancedWorldSubsystem::ApplyDefaultLifetimeForNewInstance(
+	FPhysXInstanceID ID,
+	UInstancedStaticMeshComponent* InstancedMesh)
+{
+	if (!ID.IsValid() || !InstancedMesh)
+	{
+		return;
+	}
+
+	const APhysXInstancedMeshActor* OwnerActor =
+		Cast<APhysXInstancedMeshActor>(InstancedMesh->GetOwner());
+
+	if (!OwnerActor || !OwnerActor->bEnableLifetime)
+	{
+		return;
+	}
+
+	const float LifetimeSeconds = OwnerActor->DefaultLifeTimeSeconds;
+	if (LifetimeSeconds <= 0.0f)
+	{
+		return;
+	}
+
+	SetInstanceLifetime_Internal(
+		ID,
+		GetWorldTimeSecondsSafe(),
+		LifetimeSeconds,
+		OwnerActor->DefaultLifetimeAction);
+}
+
+void UPhysXInstancedWorldSubsystem::ApplyLifetimeOverrideForNewInstance(
+	FPhysXInstanceID ID,
+	const FPhysXSpawnInstanceRequest& Request)
+{
+	if (!ID.IsValid())
+	{
+		return;
+	}
+
+	if (!Request.bOverrideLifetime)
+	{
+		return;
+	}
+
+	const float LifetimeSeconds = Request.LifeTimeSeconds;
+	if (LifetimeSeconds <= 0.0f)
+	{
+		DisableInstanceLifetime_Internal(ID);
+		return;
+	}
+
+	SetInstanceLifetime_Internal(
+		ID,
+		GetWorldTimeSecondsSafe(),
+		LifetimeSeconds,
+		Request.LifetimeAction);
+}
+
+void UPhysXInstancedWorldSubsystem::SetInstanceLifetime_Internal(
+	FPhysXInstanceID ID,
+	float NowSeconds,
+	float LifetimeSeconds,
+	EPhysXInstanceStopAction Action)
+{
+	FPhysXInstanceData* Data = Instances.Find(ID);
+	if (!Data)
+	{
+		return;
+	}
+
+	if (LifetimeSeconds <= 0.0f)
+	{
+		DisableInstanceLifetime_Internal(ID);
+		return;
+	}
+
+	++Data->LifetimeSerial;
+	Data->bHasLifetime   = true;
+	Data->ExpireAt       = NowSeconds + LifetimeSeconds;
+	Data->LifetimeAction = Action;
+
+	FLifetimeHeapEntry Entry;
+	Entry.ExpireAt = Data->ExpireAt;
+	Entry.ID       = ID;
+	Entry.Serial   = Data->LifetimeSerial;
+
+	LifetimeHeap.HeapPush(Entry, FLifetimeHeapPred());
+	
+	//UE_LOG(LogTemp, Warning, TEXT("[TTL] Set ID=%u ExpireAt=%.3f Action=%d Serial=%u"),
+	//ID.GetUniqueID(), Data->ExpireAt, (int32)Action, Data->LifetimeSerial);
+}
+
+void UPhysXInstancedWorldSubsystem::DisableInstanceLifetime_Internal(FPhysXInstanceID ID)
+{
+	FPhysXInstanceData* Data = Instances.Find(ID);
+	if (!Data)
+	{
+		return;
+	}
+
+	++Data->LifetimeSerial;
+	Data->bHasLifetime   = false;
+	Data->ExpireAt       = 0.0f;
+	Data->LifetimeAction = EPhysXInstanceStopAction::None;
+}
+
+void UPhysXInstancedWorldSubsystem::ProcessLifetimeExpirations()
+{
+	if (LifetimeHeap.Num() == 0)
+	{
+		return;
+	}
+
+	const float Now = GetWorldTimeSecondsSafe();
+	
+	//UE_LOG(LogTemp, Warning, TEXT("[TTL] Tick Now=%.3f Heap=%d TopExpire=%.3f"),
+	//Now, LifetimeHeap.Num(), (LifetimeHeap.Num() > 0) ? LifetimeHeap.HeapTop().ExpireAt : -1.0f);
+	
+	const int32 MaxToProcess = (MaxLifetimeExpirationsPerTick <= 0) ? MAX_int32 : MaxLifetimeExpirationsPerTick;
+
+	struct FExpiredLifetime
+	{
+		FPhysXInstanceID         ID;
+		EPhysXInstanceStopAction Action = EPhysXInstanceStopAction::None;
+	};
+
+	TArray<FExpiredLifetime> Expired;
+	Expired.Reserve(64);
+
+	int32 Processed = 0;
+
+	while (LifetimeHeap.Num() > 0 && Processed < MaxToProcess)
+	{
+		const FLifetimeHeapEntry& Top = LifetimeHeap.HeapTop();
+		if (Top.ExpireAt > Now)
+		{
+			break;
+		}
+
+		FLifetimeHeapEntry Entry;
+		LifetimeHeap.HeapPop(Entry, FLifetimeHeapPred(), /*bAllowShrinking=*/false);
+
+		FPhysXInstanceData* Data = Instances.Find(Entry.ID);
+		if (!Data)
+		{
+			continue;
+		}
+
+		if (!Data->bHasLifetime)
+		{
+			continue;
+		}
+
+		if (Data->LifetimeSerial != Entry.Serial)
+		{
+			continue;
+		}
+
+		if (Data->ExpireAt != Entry.ExpireAt)
+		{
+			continue;
+		}
+
+		FExpiredLifetime& Out = Expired.AddDefaulted_GetRef();
+		Out.ID     = Entry.ID;
+		Out.Action = Data->LifetimeAction;
+
+		// Disable lifetime before doing anything potentially destructive.
+		++Data->LifetimeSerial;
+		Data->bHasLifetime   = false;
+		Data->ExpireAt       = 0.0f;
+		Data->LifetimeAction = EPhysXInstanceStopAction::None;
+
+		++Processed;
+	}
+
+	for (const FExpiredLifetime& Item : Expired)
+	{
+		ApplyLifetimeAction(Item.ID, Item.Action);
+	}
+}
+
+void UPhysXInstancedWorldSubsystem::ApplyLifetimeAction(FPhysXInstanceID ID, EPhysXInstanceStopAction Action)
+{
+	//UE_LOG(LogTemp, Warning, TEXT("[TTL] EXPIRED ID=%u Action=%d"), ID.GetUniqueID(), (int32)Action);
+
+	FStopActionExecOptions Opt;
+	Opt.RemoveReason               = EPhysXInstanceRemoveReason::Expired;
+	Opt.bRemoveVisualInstance      = true;
+	Opt.bCreateStorageActorIfNeeded = true;
+
+	Opt.bUseSetInstancePhysicsEnabled = true;   // TTL uses the high-level API
+	Opt.bResetTimers                 = false;  // TTL doesn't care about stop timers
+	Opt.bDestroyBodyOnConvertFailure = false;  // matches your current TTL behavior
+
+	ExecuteInstanceStopAction_Internal(ID, Action, Opt);
+}
+
 
 // ============================================================================
 // Spawn API
@@ -597,6 +1226,9 @@ FPhysXSpawnInstanceResult UPhysXInstancedWorldSubsystem::SpawnPhysicsInstance(
 
 	// Actor keeps track of the instance handles it owns.
 	TargetActor->RegisteredInstanceIDs.Add(NewInstanceID);
+	// Apply per-spawn lifetime overrides (actor defaults are handled during registration).
+	ApplyLifetimeOverrideForNewInstance(NewInstanceID, Request);
+
 
 	// Initial velocities are applied only to the newly created instance.
 	if (!Request.InitialLinearVelocity.IsNearlyZero())
@@ -643,18 +1275,23 @@ FPhysXInstanceID UPhysXInstancedWorldSubsystem::RegisterInstance(
 
 	FPhysXInstanceID NewID(NextID++);
 
-	FPhysXInstanceData NewData;
+	FPhysXInstanceData NewData{};
 	NewData.InstancedComponent = InstancedMesh;
 	NewData.InstanceIndex      = InstanceIndex;
 	NewData.bSimulating        = bSimulate;
 	NewData.SleepTime          = 0.0f;
 	NewData.FallTime           = 0.0f;
 	NewData.bWasSleeping       = false;
+	NewData.bHasLifetime   = false;
+	NewData.ExpireAt       = 0.0f;
+	NewData.LifetimeAction = EPhysXInstanceStopAction::None;
+	NewData.LifetimeSerial = 0;
 
 #if !PHYSICS_INTERFACE_PHYSX
 	// Without PhysX, only bookkeeping data is stored.
 	Instances.Add(NewID, NewData);
 	AddSlotMapping(NewID);
+	ApplyDefaultLifetimeForNewInstance(NewID, InstancedMesh);
 	++NumBodiesTotal;
 	if (NewData.bSimulating)
 	{
@@ -668,6 +1305,7 @@ FPhysXInstanceID UPhysXInstancedWorldSubsystem::RegisterInstance(
 	{
 		Instances.Add(NewID, NewData);
 		AddSlotMapping(NewID);
+		ApplyDefaultLifetimeForNewInstance(NewID, InstancedMesh);
 		// No PxActor exists in this path, so EnsureInstanceUserData() is a no-op.
 		EnqueueAddActorToScene(NewID, InstancedMesh);
 		
@@ -706,10 +1344,23 @@ FPhysXInstanceID UPhysXInstancedWorldSubsystem::RegisterInstance(
 		return FPhysXInstanceID();
 	}
 	
+	// Apply actor-level overrides (mass/damping) before storing/enqueueing.
+	if (const APhysXInstancedMeshActor* OwnerActor = Cast<APhysXInstancedMeshActor>(InstancedMesh->GetOwner()))
+	{
+		if (physx::PxRigidActor* RA = NewData.Body.GetPxActor())
+		{
+			if (physx::PxRigidDynamic* RD = RA->is<physx::PxRigidDynamic>())
+			{
+				ApplyOwnerPhysicsOverrides(OwnerActor, InstancedMesh, OverrideMesh, RD);
+			}
+		}
+	}
+	
 	// IMPORTANT:
 	// userData setup requires the instance record to exist in Instances.
 	Instances.Add(NewID, NewData);
 	AddSlotMapping(NewID);
+	ApplyDefaultLifetimeForNewInstance(NewID, InstancedMesh);
 	EnsureInstanceUserData(NewID);
 	
 	++NumBodiesLifetimeCreated;
@@ -823,16 +1474,21 @@ void UPhysXInstancedWorldSubsystem::RegisterInstancesBatch(
 
 			const FPhysXInstanceID NewID(NextID++);
 
-			FPhysXInstanceData NewData;
+			FPhysXInstanceData NewData{};
 			NewData.InstancedComponent = InstancedMesh;
 			NewData.InstanceIndex      = InstanceIndex;
 			NewData.bSimulating        = bSimulate;
 			NewData.SleepTime          = 0.0f;
 			NewData.FallTime           = 0.0f;
 			NewData.bWasSleeping       = false;
+			NewData.bHasLifetime   = false;
+			NewData.ExpireAt       = 0.0f;
+			NewData.LifetimeAction = EPhysXInstanceStopAction::None;
+			NewData.LifetimeSerial = 0;
 
 			FPhysXInstanceData& StoredData = Instances.Add(NewID, NewData);
 			AddSlotMapping(NewID);
+			ApplyDefaultLifetimeForNewInstance(NewID, InstancedMesh);
 
 			FPhysXInstanceCreateJob& Job = Jobs.AddDefaulted_GetRef();
 			Job.ID            = NewID;
@@ -915,6 +1571,18 @@ void UPhysXInstancedWorldSubsystem::RegisterInstancesBatch(
 				continue;
 			}
 
+			// After success, apply overrides on the game thread.
+			if (const APhysXInstancedMeshActor* OwnerActor = Cast<APhysXInstancedMeshActor>(Job.ISMC ? Job.ISMC->GetOwner() : nullptr))
+			{
+				if (physx::PxRigidActor* RA = Job.Data ? Job.Data->Body.GetPxActor() : nullptr)
+				{
+					if (physx::PxRigidDynamic* RD = RA->is<physx::PxRigidDynamic>())
+					{
+						ApplyOwnerPhysicsOverrides(OwnerActor, InstancedMesh, OverrideMesh, RD);
+					}
+				}
+			}
+			
 			// Queue PhysX actor for scene insertion on the game thread.
 			EnsureInstanceUserData(Job.ID);
 			EnqueueAddActorToScene(Job.ID, Job.ISMC);
@@ -997,12 +1665,18 @@ namespace
 
 		// Auto-stop decisions.
 		bool                           bApplyStopAction = false;
+		EPhysXInstanceRemoveReason      RemoveReason = EPhysXInstanceRemoveReason::AutoStop;
 		EPhysXInstanceStopAction       ActionToApply = EPhysXInstanceStopAction::None;
 
 		// CCD decisions.
 		bool                           bEnableCCD  = false;
 		bool                           bDisableCCD = false;
 
+		// Velocity caches (computed only when required by rules).
+		FVector                        CachedLinearVelocityU = FVector::ZeroVector;
+		float                          CachedLinearSpeed = 0.0f;
+		float                          CachedAngularSpeedDeg = 0.0f;
+		
 		// Updated timers.
 		float                          NewSleepTime = 0.0f;
 		float                          NewFallTime  = 0.0f;
@@ -1010,6 +1684,378 @@ namespace
 
 	// Reused every frame to avoid per-tick allocations in AsyncPhysicsStep.
 	static TArray<FPhysXInstanceAsyncStepJob> GAsyncStepJobs;
+	
+	using FPhysXISAsyncPreComputeRuleFn  = bool (*)(float /*TimerDelta*/, FPhysXInstanceAsyncStepJob& /*Job*/);
+using FPhysXISAsyncPostComputeRuleFn = void (*)(float /*TimerDelta*/, FPhysXInstanceAsyncStepJob& /*Job*/);
+using FPhysXISAsyncPostApplyRuleFn   = void (*)(UPhysXInstancedWorldSubsystem& /*Subsystem*/, float /*TimerDelta*/, TArray<FPhysXInstanceAsyncStepJob>& /*Jobs*/);
+
+static const FPhysXISAsyncPreComputeRuleFn  GPhysXISAsyncPreComputeRules[]  = { nullptr };
+static const FPhysXISAsyncPostComputeRuleFn GPhysXISAsyncPostComputeRules[] = { nullptr };
+static const FPhysXISAsyncPostApplyRuleFn   GPhysXISAsyncPostApplyRules[]   = { nullptr };
+
+static FORCEINLINE bool RunAsyncPreComputeRules(float TimerDelta, FPhysXInstanceAsyncStepJob& Job)
+{
+	for (int32 Index = 0; GPhysXISAsyncPreComputeRules[Index] != nullptr; ++Index)
+	{
+		if (!GPhysXISAsyncPreComputeRules[Index](TimerDelta, Job))
+		{
+			return false;
+		}
+	}
+	return true;
+}
+
+static FORCEINLINE void RunAsyncPostComputeRules(float TimerDelta, FPhysXInstanceAsyncStepJob& Job)
+{
+	for (int32 Index = 0; GPhysXISAsyncPostComputeRules[Index] != nullptr; ++Index)
+	{
+		GPhysXISAsyncPostComputeRules[Index](TimerDelta, Job);
+	}
+}
+
+static FORCEINLINE void RunAsyncPostApplyRules(UPhysXInstancedWorldSubsystem& Subsystem, float TimerDelta, TArray<FPhysXInstanceAsyncStepJob>& Jobs)
+{
+	for (int32 Index = 0; GPhysXISAsyncPostApplyRules[Index] != nullptr; ++Index)
+	{
+		GPhysXISAsyncPostApplyRules[Index](Subsystem, TimerDelta, Jobs);
+	}
+}
+
+using FPhysXISAsyncComputeRuleFn = bool (*)(float /*TimerDelta*/, FPhysXInstanceAsyncStepJob& /*Job*/);
+
+static bool ComputeRule_InitAndFastPath(float TimerDelta, FPhysXInstanceAsyncStepJob& Job)
+{
+	if (!Job.Data || !Job.RigidDynamic)
+	{
+		return false;
+	}
+
+	FPhysXInstanceData* InstanceData = Job.Data;
+
+	const bool bSleepingNow = Job.RigidDynamic->isSleeping();
+	Job.bSleeping = bSleepingNow;
+
+	Job.bApplyStopAction = false;
+	Job.ActionToApply    = EPhysXInstanceStopAction::None;
+	Job.bEnableCCD       = false;
+	Job.bDisableCCD      = false;
+
+	Job.CachedLinearVelocityU = FVector::ZeroVector;
+	Job.CachedLinearSpeed     = 0.0f;
+	Job.CachedAngularSpeedDeg = 0.0f;
+
+	const bool bHasAutoStop =
+		(Job.StopConfig.bEnableAutoStop &&
+		 Job.StopConfig.Action != EPhysXInstanceStopAction::None);
+
+	const bool bHasSafetyRule =
+		Job.StopConfig.bUseMaxFallTime ||
+		Job.StopConfig.bUseMaxDistanceFromActor ||
+		Job.bUseCustomKillZ;
+
+	const bool bUsesAutoCCD =
+		(Job.CCDConfig.Mode == EPhysXInstanceCCDMode::AutoByVelocity);
+
+	const bool bCanUseSleepingFastPath =
+		InstanceData->bWasSleeping &&
+		bSleepingNow &&
+		!bHasAutoStop &&
+		!bHasSafetyRule &&
+		!bUsesAutoCCD;
+
+	if (bCanUseSleepingFastPath)
+	{
+		Job.NewSleepTime = InstanceData->SleepTime;
+		Job.NewFallTime  = InstanceData->FallTime;
+		return false;
+	}
+
+	return true;
+}
+
+static bool ComputeRule_ReadPose(float /*TimerDelta*/, FPhysXInstanceAsyncStepJob& Job)
+{
+	const PxTransform PxPose = Job.RigidDynamic->getGlobalPose();
+
+	const FVector ULocation = P2UVector(PxPose.p);
+	const FQuat   URotation = P2UQuat(PxPose.q);
+
+	Job.NewWorldTransform = FTransform(URotation, ULocation, FVector::OneVector);
+	Job.NewLocation       = ULocation;
+
+	return true;
+}
+
+static bool ComputeRule_CustomKillZ(float /*TimerDelta*/, FPhysXInstanceAsyncStepJob& Job)
+{
+	if (Job.bUseCustomKillZ && Job.NewLocation.Z < Job.CustomKillZ)
+	{
+		if (Job.LostInstanceAction != EPhysXInstanceStopAction::None)
+		{
+			Job.bApplyStopAction = true;
+			Job.ActionToApply    = Job.LostInstanceAction;
+		}
+
+		Job.NewSleepTime = 0.0f;
+		Job.NewFallTime  = 0.0f;
+		Job.RemoveReason = EPhysXInstanceRemoveReason::KillZ;
+		return false;
+	}
+
+	return true;
+}
+
+static bool ComputeRule_AutoStopDisabled(float TimerDelta, FPhysXInstanceAsyncStepJob& Job)
+{
+	if (!Job.StopConfig.bEnableAutoStop ||
+		Job.StopConfig.Action == EPhysXInstanceStopAction::None)
+	{
+		const bool bSleepingNow = Job.bSleeping;
+
+		FPhysXInstanceData* InstanceData = Job.Data;
+
+		Job.NewSleepTime = bSleepingNow
+			? (InstanceData->SleepTime + TimerDelta)
+			: 0.0f;
+
+		Job.NewFallTime = 0.0f;
+		return false;
+	}
+
+	return true;
+}
+
+static bool ComputeRule_ReadVelocitiesAndCCD(float /*TimerDelta*/, FPhysXInstanceAsyncStepJob& Job)
+{
+	const bool bNeedVelForStopCondition =
+		(Job.StopConfig.Condition == EPhysXInstanceStopCondition::VelocityThreshold ||
+		 Job.StopConfig.Condition == EPhysXInstanceStopCondition::SleepOrVelocity ||
+		 Job.StopConfig.Condition == EPhysXInstanceStopCondition::SleepAndVelocity);
+
+	const bool bNeedVelForFallTime = Job.StopConfig.bUseMaxFallTime;
+	const bool bNeedVelForCCD      = (Job.CCDConfig.Mode == EPhysXInstanceCCDMode::AutoByVelocity);
+
+	const bool bNeedAngularSpeed =
+		bNeedVelForStopCondition && (Job.StopConfig.AngularSpeedThreshold > 0.0f);
+
+	const bool bNeedLinearSpeed =
+		bNeedVelForStopCondition || bNeedVelForFallTime || bNeedVelForCCD;
+
+	if (bNeedLinearSpeed || bNeedAngularSpeed)
+	{
+		const PxVec3 LinVelPx = Job.RigidDynamic->getLinearVelocity();
+		Job.CachedLinearVelocityU = P2UVector(LinVelPx);
+		Job.CachedLinearSpeed     = Job.CachedLinearVelocityU.Size();
+
+		if (bNeedAngularSpeed)
+		{
+			const PxVec3 AngVelPx    = Job.RigidDynamic->getAngularVelocity();
+			const float  AngSpeedRad = AngVelPx.magnitude();
+			Job.CachedAngularSpeedDeg = FMath::RadiansToDegrees(AngSpeedRad);
+		}
+	}
+
+	if (Job.CCDConfig.Mode == EPhysXInstanceCCDMode::AutoByVelocity)
+	{
+		const float MinVel = Job.CCDConfig.MinCCDVelocity;
+		const bool  bShouldUseCCD = (Job.CachedLinearSpeed >= MinVel);
+
+		const bool bCurrentlyCCD =
+			Job.RigidDynamic->getRigidBodyFlags().isSet(PxRigidBodyFlag::eENABLE_CCD);
+
+		if (bShouldUseCCD && !bCurrentlyCCD)
+		{
+			Job.bEnableCCD = true;
+		}
+		else if (!bShouldUseCCD && bCurrentlyCCD)
+		{
+			Job.bDisableCCD = true;
+		}
+	}
+
+	return true;
+}
+
+static bool ComputeRule_MaxFallTime(float TimerDelta, FPhysXInstanceAsyncStepJob& Job)
+{
+	if (Job.StopConfig.bUseMaxFallTime)
+	{
+		if (Job.CachedLinearVelocityU.Z < 0.0f)
+		{
+			Job.NewFallTime += TimerDelta;
+		}
+		else
+		{
+			Job.NewFallTime = 0.0f;
+		}
+
+		if (Job.NewFallTime >= Job.StopConfig.MaxFallTime &&
+			Job.StopConfig.Action != EPhysXInstanceStopAction::None)
+		{
+			Job.bApplyStopAction = true;
+			Job.ActionToApply    = Job.StopConfig.Action;
+			Job.NewSleepTime     = 0.0f;
+			Job.NewFallTime      = 0.0f;
+			return false;
+		}
+	}
+	else
+	{
+		Job.NewFallTime = 0.0f;
+	}
+
+	return true;
+}
+
+static bool ComputeRule_MaxDistanceFromActor(float /*TimerDelta*/, FPhysXInstanceAsyncStepJob& Job)
+{
+	if (Job.StopConfig.bUseMaxDistanceFromActor &&
+		Job.bHasOwnerLocation &&
+		Job.StopConfig.MaxDistanceFromActor > 0.0f &&
+		Job.StopConfig.Action != EPhysXInstanceStopAction::None)
+	{
+		const float MaxDistSq = FMath::Square(Job.StopConfig.MaxDistanceFromActor);
+		const float DistSq    = FVector::DistSquared(Job.OwnerLocation, Job.NewLocation);
+
+		if (DistSq > MaxDistSq)
+		{
+			Job.bApplyStopAction = true;
+			Job.ActionToApply    = Job.StopConfig.Action;
+			Job.NewSleepTime     = 0.0f;
+			Job.NewFallTime      = 0.0f;
+			return false;
+		}
+	}
+
+	return true;
+}
+
+static bool ComputeRule_StopCondition(float TimerDelta, FPhysXInstanceAsyncStepJob& Job)
+{
+	const bool bSleepingNow = Job.bSleeping;
+
+	const bool bBelowVelocityThreshold =
+		(Job.CachedLinearSpeed <= Job.StopConfig.LinearSpeedThreshold) &&
+		(Job.CachedAngularSpeedDeg <= Job.StopConfig.AngularSpeedThreshold);
+
+	bool bStopConditionNow = false;
+
+	switch (static_cast<int32>(Job.StopConfig.Condition))
+	{
+	case 0: // PhysXSleepFlag
+		bStopConditionNow = bSleepingNow;
+		break;
+	case 1: // VelocityThreshold
+		bStopConditionNow = bBelowVelocityThreshold;
+		break;
+	case 2: // SleepOrVelocity
+		bStopConditionNow = bSleepingNow || bBelowVelocityThreshold;
+		break;
+	case 3: // SleepAndVelocity
+		bStopConditionNow = bSleepingNow && bBelowVelocityThreshold;
+		break;
+	default:
+		bStopConditionNow = false;
+		break;
+	}
+
+	if (!bStopConditionNow || Job.StopConfig.MinStoppedTime <= 0.0f)
+	{
+		Job.NewSleepTime = 0.0f;
+		return false;
+	}
+
+	Job.NewSleepTime += TimerDelta;
+	if (Job.NewSleepTime >= Job.StopConfig.MinStoppedTime)
+	{
+		Job.bApplyStopAction = true;
+		Job.ActionToApply    = Job.StopConfig.Action;
+		Job.NewSleepTime     = 0.0f;
+		Job.NewFallTime      = 0.0f;
+	}
+
+	return false;
+}
+
+static const FPhysXISAsyncComputeRuleFn GPhysXISAsyncComputeRules[] =
+{
+	&ComputeRule_InitAndFastPath,
+	&ComputeRule_ReadPose,
+	&ComputeRule_CustomKillZ,
+	&ComputeRule_AutoStopDisabled,
+	&ComputeRule_ReadVelocitiesAndCCD,
+	&ComputeRule_MaxFallTime,
+	&ComputeRule_MaxDistanceFromActor,
+	&ComputeRule_StopCondition,
+	nullptr
+};
+
+static void ComputeAsyncStep_Core(float TimerDelta, FPhysXInstanceAsyncStepJob& Job)
+{
+	SCOPE_CYCLE_COUNTER(STAT_PhysXInstanced_AsyncJobWorker);
+
+	for (int32 Index = 0; GPhysXISAsyncComputeRules[Index] != nullptr; ++Index)
+	{
+		if (!GPhysXISAsyncComputeRules[Index](TimerDelta, Job))
+		{
+			break;
+		}
+	}
+}
+}
+
+bool UPhysXInstancedWorldSubsystem::ExecuteInstanceStopAction_Internal(
+	FPhysXInstanceID ID,
+	EPhysXInstanceStopAction Action,
+	const FStopActionExecOptions& Opt)
+{
+	if (Action == EPhysXInstanceStopAction::None)
+	{
+		return Instances.Contains(ID);
+	}
+
+	FPhysXInstanceData* Data = Instances.Find(ID);
+	if (!Data)
+	{
+		return false;
+	}
+
+	using FHandler = bool (UPhysXInstancedWorldSubsystem::*)(
+		FPhysXInstanceID,
+		const FStopActionExecOptions&,
+		FPhysXInstanceData&);
+
+	static const FHandler Handlers[] =
+	{
+		&UPhysXInstancedWorldSubsystem::HandleStopAction_None,                       // None
+		&UPhysXInstancedWorldSubsystem::HandleStopAction_DisableSimulation,          // DisableSimulation
+		&UPhysXInstancedWorldSubsystem::HandleStopAction_DestroyBody,                // DestroyBody
+		&UPhysXInstancedWorldSubsystem::HandleStopAction_DestroyBodyAndRemoveInstance,// DestroyBodyAndRemoveInstance
+		&UPhysXInstancedWorldSubsystem::HandleStopAction_ConvertToStorage            // ConvertToStorage
+	};
+
+	const int32 ActionIndex = (int32)Action;
+	if (ActionIndex < 0 || ActionIndex >= UE_ARRAY_COUNT(Handlers) || !Handlers[ActionIndex])
+	{
+		return true;
+	}
+
+	const bool bStillExists = (this->*Handlers[ActionIndex])(ID, Opt, *Data);
+	if (!bStillExists)
+	{
+		return false;
+	}
+
+	if (Opt.bResetTimers)
+	{
+		if (FPhysXInstanceData* After = Instances.Find(ID))
+		{
+			After->SleepTime = 0.0f;
+			After->FallTime  = 0.0f;
+		}
+	}
+
+	return true;
 }
 
 #endif // PHYSICS_INTERFACE_PHYSX
@@ -1017,20 +2063,212 @@ namespace
 // ============================================================================
 // Physics update
 // ============================================================================
+void UPhysXInstancedWorldSubsystem::PhysicsStep_ApplyStopActionsAndCCD()
+{
+	if (!bPhysicsStepHasPendingApply)
+	{
+		return;
+	}
+
+	SCOPE_CYCLE_COUNTER(STAT_PhysXInstanced_AsyncApply);
+
+	TArray<FPhysXInstanceAsyncStepJob>& Jobs = GAsyncStepJobs;
+
+	for (FPhysXInstanceAsyncStepJob& JobData : Jobs)
+	{
+		FPhysXInstanceData* InstanceData = JobData.Data;
+		if (!InstanceData)
+		{
+			continue;
+		}
+
+		if (JobData.bEnableCCD && JobData.RigidDynamic)
+		{
+			JobData.RigidDynamic->setRigidBodyFlag(PxRigidBodyFlag::eENABLE_CCD, true);
+		}
+		else if (JobData.bDisableCCD && JobData.RigidDynamic)
+		{
+			JobData.RigidDynamic->setRigidBodyFlag(PxRigidBodyFlag::eENABLE_CCD, false);
+		}
+
+		if (JobData.bApplyStopAction && JobData.ActionToApply != EPhysXInstanceStopAction::None)
+		{
+			FStopActionExecOptions Opt;
+			Opt.RemoveReason                = JobData.RemoveReason;
+			Opt.bRemoveVisualInstance       = true;
+			Opt.bCreateStorageActorIfNeeded = true;
+
+			Opt.bUseSetInstancePhysicsEnabled = false;
+			Opt.bResetTimers                 = true;
+			Opt.bDestroyBodyOnConvertFailure = true;
+
+			const bool bStillExists = ExecuteInstanceStopAction_Internal(JobData.ID, JobData.ActionToApply, Opt);
+
+			if (!bStillExists || JobData.ActionToApply == EPhysXInstanceStopAction::ConvertToStorage)
+			{
+				JobData.Data         = nullptr;
+				JobData.ISMC         = nullptr;
+				JobData.RigidDynamic = nullptr;
+				continue;
+			}
+		}
+		else
+		{
+			InstanceData->SleepTime = JobData.NewSleepTime;
+			InstanceData->FallTime  = JobData.NewFallTime;
+		}
+
+		if (JobData.bSleeping)
+		{
+			++PhysicsStepLocalSleeping;
+		}
+
+		InstanceData->bWasSleeping = JobData.bSleeping;
+	}
+}
+
+void UPhysXInstancedWorldSubsystem::PhysicsStep_ApplyTransformSync()
+{
+	if (!bPhysicsStepHasPendingApply)
+	{
+		return;
+	}
+
+	SCOPE_CYCLE_COUNTER(STAT_PhysXInstanced_AsyncApply);
+
+	TArray<FPhysXInstanceAsyncStepJob>& Jobs = GAsyncStepJobs;
+
+	for (FPhysXInstanceAsyncStepJob& JobData : Jobs)
+	{
+		FPhysXInstanceData* InstanceData = JobData.Data;
+		if (!InstanceData)
+		{
+			continue;
+		}
+
+		UInstancedStaticMeshComponent* ISMComponent = JobData.ISMC;
+		if (!ISMComponent || !ISMComponent->IsValidLowLevelFast())
+		{
+			continue;
+		}
+
+		if (InstanceData->InstanceIndex == INDEX_NONE)
+		{
+			continue;
+		}
+
+		const bool bWasSleeping = JobData.bWasSleepingInitial;
+		const bool bIsSleeping  = JobData.bSleeping;
+
+		if (bIsSleeping && bWasSleeping)
+		{
+			continue;
+		}
+
+		if (UPhysXInstancedStaticMeshComponent* PhysXISMC = Cast<UPhysXInstancedStaticMeshComponent>(ISMComponent))
+		{
+			FPhysicsStepTransformBatch& Batch = PhysicsStepApplyCtx.ComponentBatches.FindOrAdd(PhysXISMC);
+			Batch.InstanceIndices.Add(InstanceData->InstanceIndex);
+			Batch.WorldTransforms.Add(JobData.NewWorldTransform);
+		}
+		else
+		{
+			ISMComponent->UpdateInstanceTransform(
+				InstanceData->InstanceIndex,
+				JobData.NewWorldTransform,
+				/*bWorldSpace=*/true,
+				/*bMarkRenderStateDirty=*/false,
+				/*bTeleport=*/false);
+
+			PhysicsStepApplyCtx.DirtyComponents.Add(ISMComponent);
+		}
+	}
+
+	for (auto& Pair : PhysicsStepApplyCtx.ComponentBatches)
+	{
+		UPhysXInstancedStaticMeshComponent* PhysXISMC = Pair.Key;
+		FPhysicsStepTransformBatch&         Batch     = Pair.Value;
+
+		if (!PhysXISMC || !PhysXISMC->IsValidLowLevelFast())
+		{
+			continue;
+		}
+
+		if (Batch.InstanceIndices.Num() == 0 ||
+			Batch.InstanceIndices.Num() != Batch.WorldTransforms.Num())
+		{
+			continue;
+		}
+
+		PhysXISMC->UpdateInstancesFromPhysXBatch_MT(
+			Batch.InstanceIndices,
+			Batch.WorldTransforms,
+			/*bTeleport=*/false);
+	}
+}
+
+void UPhysXInstancedWorldSubsystem::PhysicsStep_Finalize()
+{
+	if (!bPhysicsStepHasPendingApply)
+	{
+		return;
+	}
+
+	for (UInstancedStaticMeshComponent* ISMC : PhysicsStepApplyCtx.DirtyComponents)
+	{
+		if (ISMC && ISMC->IsValidLowLevelFast())
+		{
+			ISMC->MarkRenderStateDirty();
+		}
+	}
+
+	TArray<FPhysXInstanceAsyncStepJob>& Jobs = GAsyncStepJobs;
+	RunAsyncPostApplyRules(*this, PhysicsStepTimerDelta, Jobs);
+
+	NumBodiesTotal      = PhysicsStepLocalTotal;
+	NumBodiesSleeping   = PhysicsStepLocalSleeping;
+	NumBodiesSimulating = NumBodiesTotal - NumBodiesSleeping;
+
+	SET_DWORD_STAT(STAT_PhysXInstanced_BodiesTotal,      NumBodiesTotal);
+	SET_DWORD_STAT(STAT_PhysXInstanced_BodiesSimulating, NumBodiesSimulating);
+	SET_DWORD_STAT(STAT_PhysXInstanced_BodiesSleeping,   NumBodiesSleeping);
+
+	const uint32 LifetimeClamped = (uint32)FMath::Min<uint64>(NumBodiesLifetimeCreated, (uint64)MAX_uint32);
+	SET_DWORD_STAT(STAT_PhysXInstanced_BodiesLifetimeCreated, LifetimeClamped);
+
+	bPhysicsStepHasPendingApply = false;
+}
+
 
 void UPhysXInstancedWorldSubsystem::AsyncPhysicsStep(float DeltaTime, float SimTime)
 {
 #if !PHYSICS_INTERFACE_PHYSX
-	// No PhysX backend: nothing to do.
 	return;
 #else
+	PhysicsStep_Compute(DeltaTime, SimTime);
+	PhysicsStep_ApplyStopActionsAndCCD();
+	PhysicsStep_ApplyTransformSync();
+	PhysicsStep_Finalize();
+#endif
+}
 
-	// Early-out only when nothing is registered at all.
+void UPhysXInstancedWorldSubsystem::PhysicsStep_Compute(float DeltaTime, float SimTime)
+{
+	const float TimerDelta = FMath::Max(0.0f, SimTime);
+
+	PhysicsStepTimerDelta       = TimerDelta;
+	bPhysicsStepHasPendingApply = false;
+
+	TArray<FPhysXInstanceAsyncStepJob>& Jobs = GAsyncStepJobs;
+	Jobs.Reset();
+
+	PhysicsStepApplyCtx.Reset(0);
+
 	if (Instances.Num() == 0)
 	{
-		NumBodiesTotal = 0;
+		NumBodiesTotal      = 0;
 		NumBodiesSimulating = 0;
-		NumBodiesSleeping = 0;
+		NumBodiesSleeping   = 0;
 
 		SET_DWORD_STAT(STAT_PhysXInstanced_BodiesTotal,      0);
 		SET_DWORD_STAT(STAT_PhysXInstanced_BodiesSimulating, 0);
@@ -1043,18 +2281,12 @@ void UPhysXInstancedWorldSubsystem::AsyncPhysicsStep(float DeltaTime, float SimT
 		return;
 	}
 
-	// Total number of registered instances (simulating / sleeping / storage).
 	SET_DWORD_STAT(STAT_PhysXInstanced_InstancesTotal, Instances.Num());
 
 	SCOPE_CYCLE_COUNTER(STAT_PhysXInstanced_AsyncPhysicsStep);
 
-	// Local per-frame counters.
-	int32 LocalTotal    = 0; // total PhysX bodies with valid PxRigidDynamic
-	int32 LocalSleeping = 0; // how many of them are considered sleeping
-
-	// --------------------------------------------------------------------
-	// 0) Query active actors from the PhysX scene
-	// --------------------------------------------------------------------
+	int32 LocalTotal    = 0;
+	int32 LocalSleeping = 0;
 
 	PxScene* PxScenePtr = nullptr;
 	if (UWorld* World = GetWorld())
@@ -1067,8 +2299,8 @@ void UPhysXInstancedWorldSubsystem::AsyncPhysicsStep(float DeltaTime, float SimT
 
 	if (PxScenePtr)
 	{
-		PxU32     NumActive    = 0;
-		PxActor** ActiveArray  = PxScenePtr->getActiveActors(NumActive);
+		PxU32     NumActive   = 0;
+		PxActor** ActiveArray = PxScenePtr->getActiveActors(NumActive);
 
 		if (ActiveArray && NumActive > 0)
 		{
@@ -1089,41 +2321,24 @@ void UPhysXInstancedWorldSubsystem::AsyncPhysicsStep(float DeltaTime, float SimT
 	}
 
 #if DO_GUARD_SLOW
-	// Debug-only: verify that a single ISM slot is not used by two InstanceIDs.
 	{
 		TMap<TPair<UInstancedStaticMeshComponent*, int32>, FPhysXInstanceID> SlotOwners;
 
 		for (const TPair<FPhysXInstanceID, FPhysXInstanceData>& Pair : Instances)
 		{
 			const FPhysXInstanceData& DataCheck = Pair.Value;
-			UInstancedStaticMeshComponent* ISMCCheck = DataCheck.InstancedComponent.Get();
-
-			if (!ISMCCheck || DataCheck.InstanceIndex == INDEX_NONE)
+			UInstancedStaticMeshComponent* ISMC = DataCheck.InstancedComponent.Get();
+			if (!ISMC || DataCheck.InstanceIndex == INDEX_NONE)
 			{
 				continue;
 			}
 
-			const int32 NumInstances = ISMCCheck->GetInstanceCount();
-			if (DataCheck.InstanceIndex < 0 || DataCheck.InstanceIndex >= NumInstances)
-			{
-				UE_LOG(LogTemp, Error,
-					TEXT("[PhysXInstanced] Invalid InstanceIndex=%d (Num=%d) for ID=%u, ISMC=%s"),
-					DataCheck.InstanceIndex,
-					NumInstances,
-					Pair.Key.GetUniqueID(),
-					*GetNameSafe(ISMCCheck));
-				continue;
-			}
-
-			TPair<UInstancedStaticMeshComponent*, int32> Key(ISMCCheck, DataCheck.InstanceIndex);
+			const TPair<UInstancedStaticMeshComponent*, int32> Key(ISMC, DataCheck.InstanceIndex);
 			if (const FPhysXInstanceID* Existing = SlotOwners.Find(Key))
 			{
-				UE_LOG(LogTemp, Error,
-					TEXT("[PhysXInstanced] Duplicate slot (ISMC=%s, Index=%d) for IDs %u and %u"),
-					*GetNameSafe(ISMCCheck),
-					DataCheck.InstanceIndex,
-					Existing->GetUniqueID(),
-					Pair.Key.GetUniqueID());
+				ensureMsgf(false, TEXT("Duplicate ISM slot owner: ID=%u and ID=%u on Component=%s Index=%d"),
+					Existing->GetUniqueID(), Pair.Key.GetUniqueID(),
+					*GetNameSafe(ISMC), DataCheck.InstanceIndex);
 			}
 			else
 			{
@@ -1131,189 +2346,90 @@ void UPhysXInstancedWorldSubsystem::AsyncPhysicsStep(float DeltaTime, float SimT
 			}
 		}
 	}
-#endif // DO_GUARD_SLOW
+#endif
 
-	// --------------------------------------------------------------------
-	// 1) Build jobs for simulating bodies that are worth processing
-	// --------------------------------------------------------------------
-
-	TArray<FPhysXInstanceAsyncStepJob>& Jobs = GAsyncStepJobs;
-	Jobs.Reset();
 	Jobs.Reserve(Instances.Num());
 
+	int32 NumJobsAdded = 0;
+
+	for (TPair<FPhysXInstanceID, FPhysXInstanceData>& Pair : Instances)
 	{
-		SCOPE_CYCLE_COUNTER(STAT_PhysXInstanced_AsyncBuildJobs);
+		const FPhysXInstanceID ID = Pair.Key;
+		FPhysXInstanceData& InstanceData = Pair.Value;
 
-		struct FActorFrameConfig
+		if (!InstanceData.bSimulating)
 		{
-			FPhysXInstanceStopConfig  StopConfig;
-			FPhysXInstanceCCDConfig   CCDConfig;
-
-			bool                      bUseCustomKillZ = false;
-			float                     CustomKillZ = 0.0f;
-			EPhysXInstanceStopAction  LostInstanceAction = EPhysXInstanceStopAction::None;
-
-			FVector                   OwnerLocation = FVector::ZeroVector;
-		};
-
-		TMap<const APhysXInstancedMeshActor*, FActorFrameConfig> ActorConfigs;
-		ActorConfigs.Reserve(Actors.Num());
-
-		const int32 MaxJobsPerFrame =
-			CVarPhysXInstancedMaxJobsPerFrame.GetValueOnGameThread();
-
-		int32 NumJobsAdded = 0;
-
-		// Active-actor filtering is used only when the scene provides an active list.
-		const bool bUseActiveActorFilter = (ActiveActorsSet.Num() > 0) && (PxScenePtr != nullptr);
-
-		for (TPair<FPhysXInstanceID, FPhysXInstanceData>& Pair : Instances)
-		{
-			if (MaxJobsPerFrame > 0 && NumJobsAdded >= MaxJobsPerFrame)
-			{
-				break;
-			}
-
-			FPhysXInstanceData& InstanceData = Pair.Value;
-
-			if (!InstanceData.bSimulating)
-			{
-				continue;
-			}
-
-			PxRigidActor*   RigidActor   = InstanceData.Body.GetPxActor();
-			PxRigidDynamic* RigidDynamic = RigidActor ? RigidActor->is<PxRigidDynamic>() : nullptr;
-			if (!RigidDynamic)
-			{
-				InstanceData.bSimulating = false;
-				continue;
-			}
-
-			// Skip bodies that are not yet in a scene.
-			if (!RigidDynamic->getScene())
-			{
-				InstanceData.SleepTime = 0.0f;
-				InstanceData.FallTime  = 0.0f;
-				continue;
-			}
-
-			UInstancedStaticMeshComponent* ISMC = InstanceData.InstancedComponent.Get();
-			if (!ISMC || !ISMC->IsValidLowLevelFast())
-			{
-				continue;
-			}
-
-			// Validate InstanceIndex.
-			if (InstanceData.InstanceIndex != INDEX_NONE)
-			{
-				const int32 NumInstances = ISMC->GetInstanceCount();
-				if (InstanceData.InstanceIndex < 0 || InstanceData.InstanceIndex >= NumInstances)
-				{
-					UE_LOG(LogTemp, Error,
-						TEXT("[PhysXInstanced] AsyncPhysicsStep: InstanceIndex=%d is out of range [0, %d) for component %s. "
-							 "Destroying PhysX body and disabling simulation for this instance."),
-						InstanceData.InstanceIndex, NumInstances, *ISMC->GetName());
-
-					InstanceData.Body.Destroy();
-					InstanceData.bSimulating   = false;
-					InstanceData.InstanceIndex = INDEX_NONE;
-					InstanceData.SleepTime     = 0.0f;
-					InstanceData.FallTime      = 0.0f;
-					continue;
-				}
-			}
-
-			// At this point the body is counted as tracked for stats.
-			++LocalTotal;
-
-			// Filter by active actors from the scene when the active list is available.
-			bool bIsActiveActor = true;
-			if (bUseActiveActorFilter)
-			{
-				// Only trust ActiveActorsSet if we queried the SAME PxScene the body belongs to.
-				if (RigidDynamic->getScene() == PxScenePtr)
-				{
-					bIsActiveActor = ActiveActorsSet.Contains(RigidActor);
-				}
-				// If scenes differ (Sync vs Async), do NOT filter by ActiveActorsSet.
-			}
-
-			// Bodies reported as inactive by the scene are treated as sleeping and do not produce jobs.
-			if (!bIsActiveActor)
-			{
-				InstanceData.SleepTime    += DeltaTime;
-				InstanceData.bWasSleeping  = true;
-
-				++LocalSleeping;
-				continue;
-			}
-
-			// 1.1) Pull/cached per-actor config.
-			FActorFrameConfig* ActorCfg = nullptr;
-
-			if (AActor* Owner = ISMC->GetOwner())
-			{
-				if (const APhysXInstancedMeshActor* PhysXActor = Cast<APhysXInstancedMeshActor>(Owner))
-				{
-					ActorCfg = ActorConfigs.Find(PhysXActor);
-					if (!ActorCfg)
-					{
-						FActorFrameConfig NewCfg;
-						NewCfg.StopConfig         = PhysXActor->AutoStopConfig;
-						NewCfg.CCDConfig          = PhysXActor->CCDConfig;
-						NewCfg.bUseCustomKillZ    = PhysXActor->bUseCustomKillZ;
-						NewCfg.CustomKillZ        = PhysXActor->CustomKillZ;
-						NewCfg.LostInstanceAction = PhysXActor->LostInstanceAction;
-						NewCfg.OwnerLocation      = PhysXActor->GetActorLocation();
-
-						ActorCfg = &ActorConfigs.Add(PhysXActor, NewCfg);
-					}
-				}
-			}
-
-			FPhysXInstanceStopConfig  StopConfig;
-			FPhysXInstanceCCDConfig   CCDConfig;
-			bool                      bUseCustomKillZ    = false;
-			float                     CustomKillZ        = 0.0f;
-			EPhysXInstanceStopAction  LostInstanceAction = EPhysXInstanceStopAction::None;
-			bool                      bHasOwnerLocation  = false;
-			FVector                   OwnerLocation      = FVector::ZeroVector;
-
-			if (ActorCfg)
-			{
-				StopConfig         = ActorCfg->StopConfig;
-				CCDConfig          = ActorCfg->CCDConfig;
-				bUseCustomKillZ    = ActorCfg->bUseCustomKillZ;
-				CustomKillZ        = ActorCfg->CustomKillZ;
-				LostInstanceAction = ActorCfg->LostInstanceAction;
-				bHasOwnerLocation  = true;
-				OwnerLocation      = ActorCfg->OwnerLocation;
-			}
-
-			// 1.2) Create a job for this instance.
-			FPhysXInstanceAsyncStepJob Job;
-			Job.ID           = Pair.Key;
-			Job.Data         = &InstanceData;
-			Job.ISMC         = ISMC;
-			Job.RigidDynamic = RigidDynamic;
-
-			Job.StopConfig         = StopConfig;
-			Job.CCDConfig          = CCDConfig;
-			Job.bUseCustomKillZ    = bUseCustomKillZ;
-			Job.CustomKillZ        = CustomKillZ;
-			Job.LostInstanceAction = LostInstanceAction;
-			Job.bHasOwnerLocation  = bHasOwnerLocation;
-			Job.OwnerLocation      = OwnerLocation;
-
-			Job.NewSleepTime = InstanceData.SleepTime;
-			Job.NewFallTime  = InstanceData.FallTime;
-
-			// Cache the previous sleeping state for "just fell asleep" transform updates.
-			Job.bWasSleepingInitial = InstanceData.bWasSleeping;
-
-			Jobs.Add(Job);
-			++NumJobsAdded;
+			continue;
 		}
+
+		physx::PxRigidActor* PxActor = InstanceData.Body.GetPxActor();
+		if (!PxActor)
+		{
+			continue;
+		}
+
+		physx::PxRigidDynamic* RigidDynamic = PxActor->is<physx::PxRigidDynamic>();
+		if (!RigidDynamic)
+		{
+			continue;
+		}
+
+		++LocalTotal;
+
+		const bool bSleepingNow = RigidDynamic->isSleeping();
+		const bool bIsActive    = ActiveActorsSet.Contains(PxActor);
+
+		if (!bIsActive && bSleepingNow)
+		{
+			++LocalSleeping;
+			InstanceData.bWasSleeping = true;
+			continue;
+		}
+
+		UInstancedStaticMeshComponent* ISMC = InstanceData.InstancedComponent.Get();
+		if (!ISMC)
+		{
+			continue;
+		}
+
+		const APhysXInstancedMeshActor* OwnerActor = Cast<APhysXInstancedMeshActor>(ISMC->GetOwner());
+		if (!OwnerActor)
+		{
+			continue;
+		}
+
+		const FPhysXInstanceStopConfig StopConfig = OwnerActor->AutoStopConfig;
+		const FPhysXInstanceCCDConfig  CCDConfig  = OwnerActor->CCDConfig;
+
+		const bool bUseCustomKillZ = OwnerActor->bUseCustomKillZ;
+		const float CustomKillZ    = OwnerActor->CustomKillZ;
+
+		const EPhysXInstanceStopAction LostInstanceAction = OwnerActor->LostInstanceAction;
+
+		const bool bHasOwnerLocation = true;
+		const FVector OwnerLocation  = OwnerActor->GetActorLocation();
+
+		FPhysXInstanceAsyncStepJob Job;
+		Job.ID           = ID;
+		Job.Data         = &InstanceData;
+		Job.ISMC         = ISMC;
+		Job.RigidDynamic = RigidDynamic;
+
+		Job.StopConfig         = StopConfig;
+		Job.CCDConfig          = CCDConfig;
+		Job.bUseCustomKillZ    = bUseCustomKillZ;
+		Job.CustomKillZ        = CustomKillZ;
+		Job.LostInstanceAction = LostInstanceAction;
+		Job.bHasOwnerLocation  = bHasOwnerLocation;
+		Job.OwnerLocation      = OwnerLocation;
+
+		Job.NewSleepTime = InstanceData.SleepTime;
+		Job.NewFallTime  = InstanceData.FallTime;
+
+		Job.bWasSleepingInitial = InstanceData.bWasSleeping;
+
+		Jobs.Add(Job);
+		++NumJobsAdded;
 	}
 
 	if (Jobs.Num() == 0)
@@ -1326,238 +2442,29 @@ void UPhysXInstancedWorldSubsystem::AsyncPhysicsStep(float DeltaTime, float SimT
 		SET_DWORD_STAT(STAT_PhysXInstanced_BodiesSimulating, NumBodiesSimulating);
 		SET_DWORD_STAT(STAT_PhysXInstanced_BodiesSleeping,   NumBodiesSleeping);
 		SET_DWORD_STAT(STAT_PhysXInstanced_JobsPerFrame,     0);
+
 		const uint32 LifetimeClamped = (uint32)FMath::Min<uint64>(NumBodiesLifetimeCreated, (uint64)MAX_uint32);
 		SET_DWORD_STAT(STAT_PhysXInstanced_BodiesLifetimeCreated, LifetimeClamped);
-
 		return;
 	}
 
 	SET_DWORD_STAT(STAT_PhysXInstanced_JobsPerFrame, Jobs.Num());
 
-	// --------------------------------------------------------------------
-	// 2) Parallel phase: read PhysX state and compute decisions
-	// --------------------------------------------------------------------
-
-	auto StepAsyncJob = [DeltaTime](FPhysXInstanceAsyncStepJob& Job)
+	auto StepAsyncJob = [TimerDelta](FPhysXInstanceAsyncStepJob& Job)
 	{
-		SCOPE_CYCLE_COUNTER(STAT_PhysXInstanced_AsyncJobWorker);
-
 		if (!Job.Data || !Job.RigidDynamic)
 		{
 			return;
 		}
 
-		FPhysXInstanceData* InstanceData = Job.Data;
-
-		// Sleeping status is computed before pose evaluation.
-		const bool bSleepingNow = Job.RigidDynamic->isSleeping();
-		Job.bSleeping = bSleepingNow;
-
-		Job.bApplyStopAction = false;
-		Job.ActionToApply    = EPhysXInstanceStopAction::None;
-		Job.bEnableCCD       = false;
-		Job.bDisableCCD      = false;
-
-		const bool bHasAutoStop =
-			(Job.StopConfig.bEnableAutoStop &&
-			 Job.StopConfig.Action != EPhysXInstanceStopAction::None);
-
-		const bool bHasSafetyRule =
-			Job.StopConfig.bUseMaxFallTime ||
-			Job.StopConfig.bUseMaxDistanceFromActor ||
-			Job.bUseCustomKillZ;
-
-		const bool bUsesAutoCCD =
-			(Job.CCDConfig.Mode == EPhysXInstanceCCDMode::AutoByVelocity);
-
-		const bool bCanUseSleepingFastPath =
-			InstanceData->bWasSleeping &&
-			bSleepingNow &&
-			!bHasAutoStop &&
-			!bHasSafetyRule &&
-			!bUsesAutoCCD;
-
-		if (bCanUseSleepingFastPath)
+		if (!RunAsyncPreComputeRules(TimerDelta, Job))
 		{
-			Job.NewSleepTime = InstanceData->SleepTime;
-			Job.NewFallTime  = InstanceData->FallTime;
 			return;
 		}
 
-		// Pose
-		const PxTransform PxPose = Job.RigidDynamic->getGlobalPose();
+		ComputeAsyncStep_Core(TimerDelta, Job);
 
-		const FVector ULocation = P2UVector(PxPose.p);
-		const FQuat   URotation = P2UQuat(PxPose.q);
-
-		Job.NewWorldTransform = FTransform(URotation, ULocation, FVector::OneVector);
-		Job.NewLocation       = ULocation;
-
-		// Custom KillZ is evaluated before other rules.
-		if (Job.bUseCustomKillZ && ULocation.Z < Job.CustomKillZ)
-		{
-			if (Job.LostInstanceAction != EPhysXInstanceStopAction::None)
-			{
-				Job.bApplyStopAction = true;
-				Job.ActionToApply    = Job.LostInstanceAction;
-			}
-
-			Job.NewSleepTime = 0.0f;
-			Job.NewFallTime  = 0.0f;
-			return;
-		}
-
-		// If auto-stop is disabled, only the sleeping timer is tracked.
-		if (!Job.StopConfig.bEnableAutoStop ||
-			Job.StopConfig.Action == EPhysXInstanceStopAction::None)
-		{
-			Job.NewSleepTime = bSleepingNow
-				? (InstanceData->SleepTime + DeltaTime)
-				: 0.0f;
-
-			Job.NewFallTime = 0.0f;
-			return;
-		}
-
-		// Velocities are read only when required by stop rules or CCD.
-		FVector LinVelU     = FVector::ZeroVector;
-		float   LinearSpeed = 0.0f;
-		float   AngSpeedDeg = 0.0f;
-
-		const bool bNeedVelForStopCondition =
-			(Job.StopConfig.Condition == EPhysXInstanceStopCondition::VelocityThreshold ||
-			 Job.StopConfig.Condition == EPhysXInstanceStopCondition::SleepOrVelocity ||
-			 Job.StopConfig.Condition == EPhysXInstanceStopCondition::SleepAndVelocity);
-
-		const bool bNeedVelForFallTime = Job.StopConfig.bUseMaxFallTime;
-		const bool bNeedVelForCCD      = (Job.CCDConfig.Mode == EPhysXInstanceCCDMode::AutoByVelocity);
-
-		const bool bNeedAngularSpeed =
-			bNeedVelForStopCondition && (Job.StopConfig.AngularSpeedThreshold > 0.0f);
-
-		const bool bNeedLinearSpeed =
-			bNeedVelForStopCondition || bNeedVelForFallTime || bNeedVelForCCD;
-
-		if (bNeedLinearSpeed || bNeedAngularSpeed)
-		{
-			const PxVec3 LinVelPx = Job.RigidDynamic->getLinearVelocity();
-			LinVelU               = P2UVector(LinVelPx);
-			LinearSpeed           = LinVelU.Size();
-
-			if (bNeedAngularSpeed)
-			{
-				const PxVec3 AngVelPx    = Job.RigidDynamic->getAngularVelocity();
-				const float  AngSpeedRad = AngVelPx.magnitude();
-				AngSpeedDeg = FMath::RadiansToDegrees(AngSpeedRad);
-			}
-		}
-
-		// AutoByVelocity toggles CCD based on current linear speed.
-		if (Job.CCDConfig.Mode == EPhysXInstanceCCDMode::AutoByVelocity)
-		{
-			const float MinVel = Job.CCDConfig.MinCCDVelocity;
-			const bool  bShouldUseCCD = (LinearSpeed >= MinVel);
-
-			const bool bCurrentlyCCD =
-				Job.RigidDynamic->getRigidBodyFlags().isSet(PxRigidBodyFlag::eENABLE_CCD);
-
-			if (bShouldUseCCD && !bCurrentlyCCD)
-			{
-				Job.bEnableCCD = true;
-			}
-			else if (!bShouldUseCCD && bCurrentlyCCD)
-			{
-				Job.bDisableCCD = true;
-			}
-		}
-
-		// MaxFallTime accumulates time while Z velocity remains negative.
-		if (Job.StopConfig.bUseMaxFallTime)
-		{
-			if (LinVelU.Z < 0.0f)
-			{
-				Job.NewFallTime += DeltaTime;
-			}
-			else
-			{
-				Job.NewFallTime = 0.0f;
-			}
-
-			if (Job.NewFallTime >= Job.StopConfig.MaxFallTime &&
-				Job.StopConfig.Action != EPhysXInstanceStopAction::None)
-			{
-				Job.bApplyStopAction = true;
-				Job.ActionToApply    = Job.StopConfig.Action;
-				Job.NewSleepTime     = 0.0f;
-				Job.NewFallTime      = 0.0f;
-				return;
-			}
-		}
-		else
-		{
-			Job.NewFallTime = 0.0f;
-		}
-
-		// MaxDistanceFromActor stops the instance when it exceeds the configured radius.
-		if (Job.StopConfig.bUseMaxDistanceFromActor &&
-			Job.bHasOwnerLocation &&
-			Job.StopConfig.MaxDistanceFromActor > 0.0f &&
-			Job.StopConfig.Action != EPhysXInstanceStopAction::None)
-		{
-			const float MaxDistSq = FMath::Square(Job.StopConfig.MaxDistanceFromActor);
-			const float DistSq    = FVector::DistSquared(Job.OwnerLocation, ULocation);
-
-			if (DistSq > MaxDistSq)
-			{
-				Job.bApplyStopAction = true;
-				Job.ActionToApply    = Job.StopConfig.Action;
-				Job.NewSleepTime     = 0.0f;
-				Job.NewFallTime      = 0.0f;
-				return;
-			}
-		}
-
-		// Main stop condition based on the selected rule.
-		const bool bBelowVelocityThreshold =
-			(LinearSpeed <= Job.StopConfig.LinearSpeedThreshold) &&
-			(AngSpeedDeg <= Job.StopConfig.AngularSpeedThreshold);
-
-		bool bStopConditionNow = false;
-
-		switch (static_cast<int32>(Job.StopConfig.Condition))
-		{
-		case 0: // PhysXSleepFlag
-			bStopConditionNow = bSleepingNow;
-			break;
-		case 1: // VelocityThreshold
-			bStopConditionNow = bBelowVelocityThreshold;
-			break;
-		case 2: // SleepOrVelocity
-			bStopConditionNow = bSleepingNow || bBelowVelocityThreshold;
-			break;
-		case 3: // SleepAndVelocity
-			bStopConditionNow = bSleepingNow && bBelowVelocityThreshold;
-			break;
-		default:
-			bStopConditionNow = false;
-			break;
-		}
-
-		if (!bStopConditionNow || Job.StopConfig.MinStoppedTime <= 0.0f)
-		{
-			Job.NewSleepTime = 0.0f;
-			return;
-		}
-
-		// Accumulate time while the stop condition remains satisfied.
-		Job.NewSleepTime += DeltaTime;
-		if (Job.NewSleepTime >= Job.StopConfig.MinStoppedTime)
-		{
-			Job.bApplyStopAction = true;
-			Job.ActionToApply    = Job.StopConfig.Action;
-			Job.NewSleepTime     = 0.0f;
-			Job.NewFallTime      = 0.0f;
-		}
+		RunAsyncPostComputeRules(TimerDelta, Job);
 	};
 
 	{
@@ -1583,246 +2490,11 @@ void UPhysXInstancedWorldSubsystem::AsyncPhysicsStep(float DeltaTime, float SimT
 		}
 	}
 
-	// --------------------------------------------------------------------
-	// 3) Apply results on the game thread (two passes)
-	// --------------------------------------------------------------------
+	PhysicsStepLocalTotal    = LocalTotal;
+	PhysicsStepLocalSleeping = LocalSleeping;
 
-	{
-		SCOPE_CYCLE_COUNTER(STAT_PhysXInstanced_AsyncApply);
-
-		// Fallback components mark render state dirty once per component.
-		TSet<UInstancedStaticMeshComponent*> DirtyComponents;
-		DirtyComponents.Reserve(Jobs.Num());
-
-		struct FComponentTransformBatch
-		{
-			TArray<int32>      InstanceIndices;
-			TArray<FTransform> WorldTransforms;
-		};
-
-		// Batches are used only for UPhysXInstancedStaticMeshComponent.
-		TMap<UPhysXInstancedStaticMeshComponent*, FComponentTransformBatch> ComponentBatches;
-		ComponentBatches.Reserve(Jobs.Num());
-		
-		auto ApplyStopAction_GameThread = [this, &DirtyComponents](FPhysXInstanceAsyncStepJob& JobData)
-		{
-			FPhysXInstanceData*            InstanceData = JobData.Data;
-			UInstancedStaticMeshComponent* ISMComponent = JobData.ISMC;
-			PxRigidDynamic*                Rigid        = JobData.RigidDynamic;
-
-			if (!InstanceData)
-			{
-				return;
-			}
-
-			switch (JobData.ActionToApply)
-			{
-			case EPhysXInstanceStopAction::DisableSimulation:
-				if (Rigid)
-				{
-					Rigid->setRigidBodyFlag(PxRigidBodyFlag::eKINEMATIC,       true);
-					Rigid->setActorFlag     (PxActorFlag::eDISABLE_SIMULATION, true);
-				}
-				InstanceData->bSimulating = false;
-				break;
-
-			case EPhysXInstanceStopAction::DestroyBody:
-				ClearInstanceUserData(JobData.ID);
-				InstanceData->Body.Destroy();
-				InstanceData->bSimulating = false;
-				break;
-
-			case EPhysXInstanceStopAction::DestroyBodyAndRemoveInstance:
-			{
-					const FPhysXInstanceID RemoveID = JobData.ID;
-
-					// Remove both the body and the visual ISM instance by stable ID.
-					RemoveInstanceByID(RemoveID, /*bRemoveVisualInstance=*/true);
-
-					// IMPORTANT: RemoveInstanceByID() calls UnregisterInstance() -> map entry is gone.
-					JobData.Data         = nullptr;
-					JobData.ISMC         = nullptr;
-					JobData.RigidDynamic = nullptr;
-					return;
-			}
-				
-			case EPhysXInstanceStopAction::ConvertToStorage:
-				{
-					const FPhysXInstanceID ConvertID = JobData.ID;
-
-					// Moves the visual instance to a storage actor and destroys the PhysX body,
-					// but the stable ID remains registered (re-bound to the storage component/index).
-					if (ConvertInstanceToStaticStorage(ConvertID, /*bCreateStorageActorIfNeeded=*/true))
-					{
-						// After conversion, the PhysX body is gone.
-						JobData.RigidDynamic = nullptr;
-						InstanceData->bSimulating = false;
-						break;
-					}
-
-					// Fallback if conversion failed:
-					InstanceData->Body.Destroy();
-					InstanceData->bSimulating = false;
-					break;
-				}
-
-			default:
-				break;
-			}
-
-			InstanceData->SleepTime = 0.0f;
-			InstanceData->FallTime  = 0.0f;
-		};
-
-		// PASS 1: apply CCD toggles, stop actions, timers, and sleeping flags.
-		for (FPhysXInstanceAsyncStepJob& JobData : Jobs)
-		{
-			FPhysXInstanceData* InstanceData = JobData.Data;
-			if (!InstanceData)
-			{
-				continue;
-			}
-
-			// CCD toggles.
-			if (JobData.bEnableCCD && JobData.RigidDynamic)
-			{
-				JobData.RigidDynamic->setRigidBodyFlag(PxRigidBodyFlag::eENABLE_CCD, true);
-			}
-			else if (JobData.bDisableCCD && JobData.RigidDynamic)
-			{
-				JobData.RigidDynamic->setRigidBodyFlag(PxRigidBodyFlag::eENABLE_CCD, false);
-			}
-
-			// Apply stop-action or store updated timers.
-			if (JobData.bApplyStopAction && JobData.ActionToApply != EPhysXInstanceStopAction::None)
-			{
-				ApplyStopAction_GameThread(JobData);
-
-				// After ConvertToStorage the instance may be unregistered -> pointer becomes invalid.
-				InstanceData = JobData.Data;
-				if (!InstanceData)
-				{
-					continue; // Converted & unregistered -> skip rest of this job in PASS 1
-				}
-			}
-			else
-			{
-				InstanceData->SleepTime = JobData.NewSleepTime;
-				InstanceData->FallTime  = JobData.NewFallTime;
-			}
-
-
-			if (JobData.bSleeping)
-			{
-				++LocalSleeping;
-			}
-
-			// Cache sleeping state for the next-frame fast path.
-			InstanceData->bWasSleeping = JobData.bSleeping;
-		}
-
-		// PASS 2: batch transform updates for instances that still exist.
-		for (FPhysXInstanceAsyncStepJob& JobData : Jobs)
-		{
-			FPhysXInstanceData* InstanceData = JobData.Data;
-			if (!InstanceData)
-			{
-				continue;
-			}
-
-			UInstancedStaticMeshComponent* ISMComponent = JobData.ISMC;
-			if (!ISMComponent || !ISMComponent->IsValidLowLevelFast())
-			{
-				continue;
-			}
-
-			// The instance may have been removed in PASS 1.
-			if (InstanceData->InstanceIndex == INDEX_NONE)
-			{
-				continue;
-			}
-
-			const bool bWasSleeping = JobData.bWasSleepingInitial;
-			const bool bIsSleeping  = JobData.bSleeping;
-
-			// Transform is updated when the body is active or has just transitioned to sleeping.
-			const bool bNeedTransformUpdate =
-				(!bIsSleeping || !bWasSleeping);
-
-			if (!bNeedTransformUpdate)
-			{
-				continue;
-			}
-
-			if (UPhysXInstancedStaticMeshComponent* PhysXISMC =
-				Cast<UPhysXInstancedStaticMeshComponent>(ISMComponent))
-			{
-				FComponentTransformBatch& Batch = ComponentBatches.FindOrAdd(PhysXISMC);
-				Batch.InstanceIndices.Add(InstanceData->InstanceIndex);
-				Batch.WorldTransforms.Add(JobData.NewWorldTransform);
-			}
-			else
-			{
-				// Fallback: update a generic ISM component instance one by one.
-				ISMComponent->UpdateInstanceTransform(
-					InstanceData->InstanceIndex,
-					JobData.NewWorldTransform,
-					/*bWorldSpace=*/true,
-					/*bMarkRenderStateDirty=*/false,
-					/*bTeleport=*/false);
-
-				DirtyComponents.Add(ISMComponent);
-			}
-		}
-
-		// Apply batched updates for PhysX ISM components.
-		for (auto& Pair : ComponentBatches)
-		{
-			UPhysXInstancedStaticMeshComponent* PhysXISMC = Pair.Key;
-			FComponentTransformBatch&           Batch     = Pair.Value;
-
-			if (!PhysXISMC || !PhysXISMC->IsValidLowLevelFast())
-			{
-				continue;
-			}
-
-			if (Batch.InstanceIndices.Num() == 0 ||
-				Batch.InstanceIndices.Num() != Batch.WorldTransforms.Num())
-			{
-				continue;
-			}
-
-			PhysXISMC->UpdateInstancesFromPhysXBatch_MT(
-				Batch.InstanceIndices,
-				Batch.WorldTransforms,
-				/*bTeleport=*/false);
-		}
-
-		// Mark render state dirty once per fallback component.
-		for (UInstancedStaticMeshComponent* ISMC : DirtyComponents)
-		{
-			if (ISMC && ISMC->IsValidLowLevelFast())
-			{
-				ISMC->MarkRenderStateDirty();
-			}
-		}
-	}
-
-	// Final counters: total / sleeping / simulating.
-	NumBodiesTotal      = LocalTotal;
-	NumBodiesSleeping   = LocalSleeping;
-	NumBodiesSimulating = NumBodiesTotal - NumBodiesSleeping;
-
-	SET_DWORD_STAT(STAT_PhysXInstanced_BodiesTotal,      NumBodiesTotal);
-	SET_DWORD_STAT(STAT_PhysXInstanced_BodiesSimulating, NumBodiesSimulating);
-	SET_DWORD_STAT(STAT_PhysXInstanced_BodiesSleeping,   NumBodiesSleeping);
-
-	const uint32 LifetimeClamped =
-	(uint32)FMath::Min<uint64>(NumBodiesLifetimeCreated, (uint64)MAX_uint32);
-
-	SET_DWORD_STAT(STAT_PhysXInstanced_BodiesLifetimeCreated, LifetimeClamped);
-
-#endif // PHYSICS_INTERFACE_PHYSX
+	PhysicsStepApplyCtx.Reset(Jobs.Num());
+	bPhysicsStepHasPendingApply = true;
 }
 
 // ============================================================================
@@ -1852,36 +2524,78 @@ bool UPhysXInstancedWorldSubsystem::SetInstancePhysicsEnabled(
 		return false;
 	}
 
+	APhysXInstancedMeshActor* Owner = Cast<APhysXInstancedMeshActor>(ISMC->GetOwner());
+	const TWeakObjectPtr<APhysXInstancedMeshActor> OwnerWeak(Owner);
+
+	// ---------------------------------------------------------------------
+	// PRE/POST PHYSICS EVENTS
+	// Pre: fire right before we start touching PhysX/flags
+	// Post: always fire on exit with bSuccess (final return value)
+	// ---------------------------------------------------------------------
+
+	const bool bFirePre =
+		IsValid(Owner) &&
+		IsEventEnabled(Owner, EPhysXInstanceEventFlags::PrePhysics) &&
+		(Owner->OnInstancePrePhysics.IsBound() || HasInterfaceEvents(Owner));
+
+	const bool bFirePost =
+		IsValid(Owner) &&
+		IsEventEnabled(Owner, EPhysXInstanceEventFlags::PostPhysics) &&
+		(Owner->OnInstancePostPhysics.IsBound() || HasInterfaceEvents(Owner));
+
+	if (bFirePre)
+	{
+		// Use shared helper from anonymous namespace (defined выше в файле).
+		::FirePrePhysics(Owner, ID, bEnable, bDestroyBodyIfDisabling);
+	}
+
+	bool bSuccess = false;
+	ON_SCOPE_EXIT
+	{
+		if (!bFirePost)
+		{
+			return;
+		}
+
+		if (OwnerWeak.IsValid())
+		{
+			::FirePostPhysics(OwnerWeak.Get(), ID, bEnable, bDestroyBodyIfDisabling, bSuccess);
+		}
+	};
+
+	// ---------------------------------------------------------------------
+	// Main logic
+	// ---------------------------------------------------------------------
+
 	physx::PxRigidActor*   Actor        = Data->Body.GetPxActor();
 	physx::PxRigidDynamic* RigidDynamic = Actor ? Actor->is<physx::PxRigidDynamic>() : nullptr;
 
 	if (bEnable)
 	{
+		// Read settings once (authoritative source is the owner actor).
+		EPhysXInstanceShapeType ShapeType = EPhysXInstanceShapeType::Box;
+		UStaticMesh* OverrideMesh         = nullptr;
+		bool bUseGravity                  = true;
+
+		if (const APhysXInstancedMeshActor* OwnerActor = Cast<APhysXInstancedMeshActor>(ISMC->GetOwner()))
+		{
+			ShapeType    = OwnerActor->InstanceShapeType;
+			OverrideMesh = OwnerActor->OverrideCollisionMesh;
+			bUseGravity  = OwnerActor->bInstancesUseGravity;
+		}
+
+		// Fallback to component mesh if no override mesh.
+		if (!OverrideMesh)
+		{
+			OverrideMesh = ISMC->GetStaticMesh();
+		}
+
 		// If there is no body yet, try to create one now.
 		if (!RigidDynamic)
 		{
-			EPhysXInstanceShapeType ShapeType = EPhysXInstanceShapeType::Box;
-			UStaticMesh* OverrideMesh         = nullptr;
-			bool bUseGravity                  = true;
-
-			if (AActor* Owner = ISMC->GetOwner())
-			{
-				if (const APhysXInstancedMeshActor* PhysXActor =
-					Cast<APhysXInstancedMeshActor>(Owner))
-				{
-					ShapeType    = PhysXActor->InstanceShapeType;
-					OverrideMesh = PhysXActor->OverrideCollisionMesh;
-					bUseGravity  = PhysXActor->bInstancesUseGravity;
-				}
-			}
-
-			if (!OverrideMesh)
-			{
-				OverrideMesh = ISMC->GetStaticMesh();
-			}
-
 			if (!GInstancedDefaultMaterial)
 			{
+				// bSuccess stays false; PostPhysics will get false.
 				return false;
 			}
 
@@ -1893,6 +2607,7 @@ bool UPhysXInstancedWorldSubsystem::SetInstancePhysicsEnabled(
 				ShapeType,
 				OverrideMesh))
 			{
+				// bSuccess stays false; PostPhysics will get false.
 				return false;
 			}
 
@@ -1909,18 +2624,14 @@ bool UPhysXInstancedWorldSubsystem::SetInstancePhysicsEnabled(
 			// Switch from kinematic back to dynamic simulation.
 			RigidDynamic->setRigidBodyFlag(PxRigidBodyFlag::eKINEMATIC, false);
 
-			bool bUseGravity = true;
-			if (AActor* Owner = ISMC->GetOwner())
-			{
-				if (const APhysXInstancedMeshActor* PhysXActor =
-					Cast<APhysXInstancedMeshActor>(Owner))
-				{
-					bUseGravity = PhysXActor->bInstancesUseGravity;
-				}
-			}
-
 			RigidDynamic->setActorFlag(PxActorFlag::eDISABLE_GRAVITY, !bUseGravity);
 			RigidDynamic->setActorFlag(PxActorFlag::eDISABLE_SIMULATION, false);
+
+			// Apply mass/damping overrides every time we (re)enable.
+			if (const APhysXInstancedMeshActor* OwnerActor = Cast<APhysXInstancedMeshActor>(ISMC->GetOwner()))
+			{
+				ApplyOwnerPhysicsOverrides(OwnerActor, ISMC, OverrideMesh, RigidDynamic);
+			}
 
 			Data->bSimulating = true;
 		}
@@ -1935,6 +2646,9 @@ bool UPhysXInstancedWorldSubsystem::SetInstancePhysicsEnabled(
 		{
 			if (bDestroyBodyIfDisabling)
 			{
+				// IMPORTANT: if this ID is queued for deferred AddActorToScene, kill those entries.
+				InvalidatePendingAddEntries(ID);
+
 				ClearInstanceUserData(ID);
 				// Destroy the PhysX body while keeping the visual instance.
 				Data->Body.Destroy();
@@ -1963,13 +2677,42 @@ bool UPhysXInstancedWorldSubsystem::SetInstancePhysicsEnabled(
 		}
 	}
 
-	return true;
+	// Success must reflect the actual outcome.
+	bSuccess = bEnable ? Data->bSimulating : true;
+	return bSuccess;
 #endif // PHYSICS_INTERFACE_PHYSX
 }
+
+
 
 bool UPhysXInstancedWorldSubsystem::ConvertInstanceToStaticStorage(
 	FPhysXInstanceID ID,
 	bool bCreateStorageActorIfNeeded)
+{
+	// Public call is always explicit.
+	return ConvertInstanceToStaticStorage_Internal(
+		ID,
+		bCreateStorageActorIfNeeded,
+		EPhysXInstanceConvertReason::Explicit);
+}
+
+
+bool UPhysXInstancedWorldSubsystem::ConvertStorageInstanceToDynamic(
+	FPhysXInstanceID ID,
+	bool bCreateDynamicActorIfNeeded)
+{
+	// Public call is always explicit.
+	return ConvertStorageInstanceToDynamic_Internal(
+		ID,
+		bCreateDynamicActorIfNeeded,
+		EPhysXInstanceConvertReason::Explicit);
+}
+
+
+bool UPhysXInstancedWorldSubsystem::ConvertInstanceToStaticStorage_Internal(
+	FPhysXInstanceID ID,
+	bool bCreateStorageActorIfNeeded,
+	EPhysXInstanceConvertReason Reason)
 {
 	FPhysXInstanceData* Data = Instances.Find(ID);
 	if (!Data)
@@ -1996,8 +2739,7 @@ bool UPhysXInstancedWorldSubsystem::ConvertInstanceToStaticStorage(
 		return false;
 	}
 
-	APhysXInstancedMeshActor* SourceActor =
-		Cast<APhysXInstancedMeshActor>(ISMC->GetOwner());
+	APhysXInstancedMeshActor* SourceActor = Cast<APhysXInstancedMeshActor>(ISMC->GetOwner());
 	if (!SourceActor)
 	{
 		return false;
@@ -2038,12 +2780,12 @@ bool UPhysXInstancedWorldSubsystem::ConvertInstanceToStaticStorage(
 
 		const int32 NumA = A->InstanceOverrideMaterials.Num();
 		const int32 NumB = B->InstanceOverrideMaterials.Num();
-		const int32 Num  = FMath::Min(NumA, NumB);
 
 		if (NumA != NumB)
 		{
 			return false;
 		}
+
 		for (int32 Index = 0; Index < NumA; ++Index)
 		{
 			if (A->InstanceOverrideMaterials[Index] != B->InstanceOverrideMaterials[Index])
@@ -2097,8 +2839,7 @@ bool UPhysXInstancedWorldSubsystem::ConvertInstanceToStaticStorage(
 		}
 
 		FActorSpawnParameters SpawnParams;
-		SpawnParams.SpawnCollisionHandlingOverride =
-			ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+		SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
 
 		StorageActor = World->SpawnActor<APhysXInstancedMeshActor>(
 			APhysXInstancedMeshActor::StaticClass(),
@@ -2141,17 +2882,17 @@ bool UPhysXInstancedWorldSubsystem::ConvertInstanceToStaticStorage(
 
 			const FName StorageProfile =
 				(StorageActor->StorageCollisionProfile.Name != NAME_None)
-			? StorageActor->StorageCollisionProfile.Name
-			: StorageActor->InstancesCollisionProfile.Name;
+					? StorageActor->StorageCollisionProfile.Name
+					: StorageActor->InstancesCollisionProfile.Name;
+
 			if (StorageProfile != NAME_None)
-				{
+			{
 				StorageISMC->SetCollisionProfileName(StorageProfile);
-				}
-			
+			}
+
 			StorageISMC->SetCollisionEnabled(StorageActor->StorageCollisionEnabled);
 
-			StorageISMC->SetInstancesAffectNavigation(
-				StorageActor->bStorageInstancesAffectNavigation);
+			StorageISMC->SetInstancesAffectNavigation(StorageActor->bStorageInstancesAffectNavigation);
 		}
 	}
 
@@ -2166,12 +2907,90 @@ bool UPhysXInstancedWorldSubsystem::ConvertInstanceToStaticStorage(
 	StorageISMC->SetInstancesAffectNavigation(StorageActor->bStorageInstancesAffectNavigation);
 
 	// ---------------------------------------------------------------------
+	// PRE/POST CONVERT EVENTS
+	// Signature assumed: (ID, Reason, FromActor, ToActor, WorldTM)
+	// ---------------------------------------------------------------------
+
+	const bool bFirePre_Source =
+		IsEventEnabled(SourceActor, EPhysXInstanceEventFlags::PreConvert) &&
+		(SourceActor->OnInstancePreConvert.IsBound() || HasInterfaceEvents(SourceActor));
+
+	const bool bFirePost_Source =
+		IsEventEnabled(SourceActor, EPhysXInstanceEventFlags::PostConvert) &&
+		(SourceActor->OnInstancePostConvert.IsBound() || HasInterfaceEvents(SourceActor));
+
+	const bool bFirePre_Storage =
+		IsEventEnabled(StorageActor, EPhysXInstanceEventFlags::PreConvert) &&
+		(StorageActor->OnInstancePreConvert.IsBound() || HasInterfaceEvents(StorageActor));
+
+	const bool bFirePost_Storage =
+		IsEventEnabled(StorageActor, EPhysXInstanceEventFlags::PostConvert) &&
+		(StorageActor->OnInstancePostConvert.IsBound() || HasInterfaceEvents(StorageActor));
+
+	auto FirePreConvert = [&](APhysXInstancedMeshActor* Actor)
+	{
+		if (!Actor)
+		{
+			return;
+		}
+
+		Actor->OnInstancePreConvert.Broadcast(ID, Reason, SourceActor, StorageActor, WorldTM);
+
+		if (HasInterfaceEvents(Actor))
+		{
+			IPhysXInstanceEvents::Execute_OnInstancePreConvert(Actor, ID, Reason, SourceActor, StorageActor, WorldTM);
+		}
+	};
+
+	auto FirePostConvert = [&](APhysXInstancedMeshActor* Actor)
+	{
+		if (!Actor)
+		{
+			return;
+		}
+
+		Actor->OnInstancePostConvert.Broadcast(ID, Reason, SourceActor, StorageActor, WorldTM);
+
+		if (HasInterfaceEvents(Actor))
+		{
+			IPhysXInstanceEvents::Execute_OnInstancePostConvert(Actor, ID, Reason, SourceActor, StorageActor, WorldTM);
+		}
+	};
+
+	// Fire PreConvert right before we start mutating data.
+	if (bFirePre_Source)
+	{
+		FirePreConvert(SourceActor);
+	}
+	if (bFirePre_Storage && StorageActor != SourceActor)
+	{
+		FirePreConvert(StorageActor);
+	}
+
+	// Always fire PostConvert even on early returns after this point.
+	const bool bNeedPost = (bFirePost_Source || bFirePost_Storage);
+	ON_SCOPE_EXIT
+	{
+		if (!bNeedPost)
+		{
+			return;
+		}
+
+		if (bFirePost_Source)
+		{
+			FirePostConvert(SourceActor);
+		}
+		if (bFirePost_Storage && StorageActor != SourceActor)
+		{
+			FirePostConvert(StorageActor);
+		}
+	};
+
+	// ---------------------------------------------------------------------
 	// 2) Add a new ISM instance into the storage actor
 	// ---------------------------------------------------------------------
 
-	const int32 StorageIndex =
-		StorageISMC->AddInstanceWorldSpace(WorldTM);
-
+	const int32 StorageIndex = StorageISMC->AddInstanceWorldSpace(WorldTM);
 	if (StorageIndex == INDEX_NONE)
 	{
 		return false;
@@ -2184,8 +3003,6 @@ bool UPhysXInstancedWorldSubsystem::ConvertInstanceToStaticStorage(
 
 	const int32 RemovedIndex = Data->InstanceIndex;
 
-	// If the body is still queued for scene insertion, invalidate it now.
-	// Otherwise ProcessPendingAddActors() may keep touching this ID after conversion.
 #if PHYSICS_INTERFACE_PHYSX
 	InvalidatePendingAddEntries(ID);
 #endif
@@ -2238,9 +3055,11 @@ bool UPhysXInstancedWorldSubsystem::ConvertInstanceToStaticStorage(
 	return true;
 }
 
-bool UPhysXInstancedWorldSubsystem::ConvertStorageInstanceToDynamic(
+
+bool UPhysXInstancedWorldSubsystem::ConvertStorageInstanceToDynamic_Internal(
 	FPhysXInstanceID ID,
-	bool bCreateDynamicActorIfNeeded)
+	bool bCreateDynamicActorIfNeeded,
+	EPhysXInstanceConvertReason Reason)
 {
 	FPhysXInstanceData* Data = Instances.Find(ID);
 	if (!Data)
@@ -2248,8 +3067,8 @@ bool UPhysXInstancedWorldSubsystem::ConvertStorageInstanceToDynamic(
 		return false;
 	}
 
-	UInstancedStaticMeshComponent* StorageISMC = Data->InstancedComponent.Get();
-	if (!StorageISMC || !StorageISMC->IsValidLowLevelFast())
+	UInstancedStaticMeshComponent* StorageISMC_Base = Data->InstancedComponent.Get();
+	if (!StorageISMC_Base || !StorageISMC_Base->IsValidLowLevelFast())
 	{
 		return false;
 	}
@@ -2260,7 +3079,7 @@ bool UPhysXInstancedWorldSubsystem::ConvertStorageInstanceToDynamic(
 		return false;
 	}
 
-	APhysXInstancedMeshActor* StorageActor = Cast<APhysXInstancedMeshActor>(StorageISMC->GetOwner());
+	APhysXInstancedMeshActor* StorageActor = Cast<APhysXInstancedMeshActor>(StorageISMC_Base->GetOwner());
 	if (!StorageActor)
 	{
 		return false;
@@ -2274,7 +3093,7 @@ bool UPhysXInstancedWorldSubsystem::ConvertStorageInstanceToDynamic(
 
 	// Get world transform from the storage instance.
 	FTransform WorldTM;
-	if (!StorageISMC->GetInstanceTransform(StorageIndex, WorldTM, /*bWorldSpace=*/true))
+	if (!StorageISMC_Base->GetInstanceTransform(StorageIndex, WorldTM, /*bWorldSpace=*/true))
 	{
 		return false;
 	}
@@ -2282,7 +3101,7 @@ bool UPhysXInstancedWorldSubsystem::ConvertStorageInstanceToDynamic(
 	UStaticMesh* StaticMesh = StorageActor->InstanceStaticMesh;
 	if (!StaticMesh)
 	{
-		StaticMesh = StorageISMC->GetStaticMesh();
+		StaticMesh = StorageISMC_Base->GetStaticMesh();
 	}
 	if (!StaticMesh)
 	{
@@ -2396,15 +3215,13 @@ bool UPhysXInstancedWorldSubsystem::ConvertStorageInstanceToDynamic(
 		TargetActor->bIsStorageActor    = false;
 		TargetActor->bSimulateInstances = true;
 
-		// IMPORTANT: dynamic ISM collision should generally be disabled to avoid double collision.
+		// IMPORTANT: dynamic ISM collision should be disabled to avoid double collision.
 		TargetActor->bDisableISMPhysics = true;
 
 		// Copy mesh/material settings from the storage actor.
 		TargetActor->InstanceStaticMesh         = StaticMesh;
 		TargetActor->bOverrideInstanceMaterials = StorageActor->bOverrideInstanceMaterials;
 		TargetActor->InstanceOverrideMaterials  = StorageActor->InstanceOverrideMaterials;
-
-		TargetActor->ApplyInstanceMaterials();
 	}
 
 	if (!TargetActor || !TargetActor->InstancedMesh)
@@ -2419,11 +3236,105 @@ bool UPhysXInstancedWorldSubsystem::ConvertStorageInstanceToDynamic(
 		TargetActor->PhysXActorID = NewActorID;
 	}
 
-	UInstancedStaticMeshComponent* TargetISMC = TargetActor->InstancedMesh;
-	if (!TargetISMC)
+	UPhysXInstancedStaticMeshComponent* TargetISMC = TargetActor->InstancedMesh;
+	if (!TargetISMC || !TargetISMC->IsValidLowLevelFast())
 	{
 		return false;
 	}
+
+	// Enforce dynamic container invariants (avoid double collision).
+	TargetActor->bStorageOnly       = false;
+	TargetActor->bIsStorageActor    = false;
+	TargetActor->bSimulateInstances = true;
+	TargetActor->bDisableISMPhysics = true;
+
+	if (TargetISMC->GetStaticMesh() != StaticMesh)
+	{
+		TargetISMC->SetStaticMesh(StaticMesh);
+	}
+	TargetActor->ApplyInstanceMaterials();
+
+	TargetISMC->SetSimulatePhysics(false);
+	TargetISMC->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+
+	// ---------------------------------------------------------------------
+	// PRE/POST CONVERT EVENTS
+	// Signature assumed: (ID, Reason, FromActor, ToActor, WorldTM)
+	// ---------------------------------------------------------------------
+
+	const bool bFirePre_From =
+		IsEventEnabled(StorageActor, EPhysXInstanceEventFlags::PreConvert) &&
+		(StorageActor->OnInstancePreConvert.IsBound() || HasInterfaceEvents(StorageActor));
+
+	const bool bFirePost_From =
+		IsEventEnabled(StorageActor, EPhysXInstanceEventFlags::PostConvert) &&
+		(StorageActor->OnInstancePostConvert.IsBound() || HasInterfaceEvents(StorageActor));
+
+	const bool bFirePre_To =
+		IsEventEnabled(TargetActor, EPhysXInstanceEventFlags::PreConvert) &&
+		(TargetActor->OnInstancePreConvert.IsBound() || HasInterfaceEvents(TargetActor));
+
+	const bool bFirePost_To =
+		IsEventEnabled(TargetActor, EPhysXInstanceEventFlags::PostConvert) &&
+		(TargetActor->OnInstancePostConvert.IsBound() || HasInterfaceEvents(TargetActor));
+
+	auto FirePreConvert = [&](APhysXInstancedMeshActor* Actor)
+	{
+		if (!Actor)
+		{
+			return;
+		}
+
+		Actor->OnInstancePreConvert.Broadcast(ID, Reason, StorageActor, TargetActor, WorldTM);
+
+		if (HasInterfaceEvents(Actor))
+		{
+			IPhysXInstanceEvents::Execute_OnInstancePreConvert(Actor, ID, Reason, StorageActor, TargetActor, WorldTM);
+		}
+	};
+
+	auto FirePostConvert = [&](APhysXInstancedMeshActor* Actor)
+	{
+		if (!Actor)
+		{
+			return;
+		}
+
+		Actor->OnInstancePostConvert.Broadcast(ID, Reason, StorageActor, TargetActor, WorldTM);
+
+		if (HasInterfaceEvents(Actor))
+		{
+			IPhysXInstanceEvents::Execute_OnInstancePostConvert(Actor, ID, Reason, StorageActor, TargetActor, WorldTM);
+		}
+	};
+
+	// Fire PreConvert right before we start mutating data/instances.
+	if (bFirePre_From)
+	{
+		FirePreConvert(StorageActor);
+	}
+	if (bFirePre_To && TargetActor != StorageActor)
+	{
+		FirePreConvert(TargetActor);
+	}
+
+	bool bConvertedSuccessfully = false;
+	ON_SCOPE_EXIT
+	{
+		if (!bConvertedSuccessfully)
+		{
+			return;
+		}
+
+		if (bFirePost_From)
+		{
+			FirePostConvert(StorageActor);
+		}
+		if (bFirePost_To && TargetActor != StorageActor)
+		{
+			FirePostConvert(TargetActor);
+		}
+	};
 
 	// ---------------------------------------------------------------------
 	// 2) Add a visual instance to the target actor (dynamic container).
@@ -2435,11 +3346,11 @@ bool UPhysXInstancedWorldSubsystem::ConvertStorageInstanceToDynamic(
 		return false;
 	}
 
+#if PHYSICS_INTERFACE_PHYSX
 	// ---------------------------------------------------------------------
 	// 3) Create a PhysX body for the NEW target slot first (so we can rollback safely).
 	// ---------------------------------------------------------------------
 
-#if PHYSICS_INTERFACE_PHYSX
 	if (!GInstancedDefaultMaterial)
 	{
 		TargetISMC->RemoveInstance(TargetIndex);
@@ -2449,11 +3360,8 @@ bool UPhysXInstancedWorldSubsystem::ConvertStorageInstanceToDynamic(
 	EPhysXInstanceShapeType ShapeType = EPhysXInstanceShapeType::Box;
 	UStaticMesh* OverrideMesh = nullptr;
 
-	if (const APhysXInstancedMeshActor* PhysXActor = Cast<APhysXInstancedMeshActor>(TargetISMC->GetOwner()))
-	{
-		ShapeType    = PhysXActor->InstanceShapeType;
-		OverrideMesh = PhysXActor->OverrideCollisionMesh;
-	}
+	ShapeType    = TargetActor->InstanceShapeType;
+	OverrideMesh = TargetActor->OverrideCollisionMesh;
 
 	FPhysXInstanceBody NewBody;
 	if (!NewBody.CreateFromInstancedStaticMesh(
@@ -2473,13 +3381,16 @@ bool UPhysXInstancedWorldSubsystem::ConvertStorageInstanceToDynamic(
 	// 4) Commit: remove storage instance and rebind the stable ID.
 	// ---------------------------------------------------------------------
 
+#if PHYSICS_INTERFACE_PHYSX
+	// If ID was still queued from a previous dynamic state, kill those entries before rebinding.
 	InvalidatePendingAddEntries(ID);
+#endif
 
 	// Remove the old slot mapping BEFORE changing Data.
 	RemoveSlotMapping(ID);
 
 	// Remove from storage (this compacts indices).
-	if (!StorageISMC->RemoveInstance(StorageIndex))
+	if (!StorageISMC_Base->RemoveInstance(StorageIndex))
 	{
 		// Rollback: remove the new target instance.
 		TargetISMC->RemoveInstance(TargetIndex);
@@ -2488,7 +3399,7 @@ bool UPhysXInstancedWorldSubsystem::ConvertStorageInstanceToDynamic(
 		AddSlotMapping(ID);
 
 #if PHYSICS_INTERFACE_PHYSX
-		// NewBody owns a Px pointer, but its destructor does not destroy; do it explicitly.
+		// NewBody owns a Px pointer; destroy explicitly on rollback.
 		NewBody.Destroy();
 #endif
 		return false;
@@ -2499,38 +3410,51 @@ bool UPhysXInstancedWorldSubsystem::ConvertStorageInstanceToDynamic(
 	TargetActor->RegisteredInstanceIDs.Add(ID);
 
 	// Fix indices for other storage-bound IDs affected by compaction.
-	FixInstanceIndicesAfterRemoval(StorageISMC, StorageIndex);
+	FixInstanceIndicesAfterRemoval(StorageISMC_Base, StorageIndex);
 
 	// Rebind stable ID to the new dynamic slot.
 	Data->InstancedComponent = TargetISMC;
 	Data->InstanceIndex      = TargetIndex;
-	Data->bSimulating        = true;
-	Data->SleepTime          = 0.0f;
-	Data->FallTime           = 0.0f;
-	Data->bWasSleeping       = false;
 
 #if PHYSICS_INTERFACE_PHYSX
+	Data->bSimulating  = true;
+	Data->SleepTime    = 0.0f;
+	Data->FallTime     = 0.0f;
+	Data->bWasSleeping = false;
+
 	// Replace body (storage instances should have no body).
 	ClearInstanceUserData(ID);
 	Data->Body.Destroy();
 	Data->Body = NewBody;
 
 	EnsureInstanceUserData(ID);
-	EnqueueAddActorToScene(ID, TargetISMC);
 	++NumBodiesLifetimeCreated;
+#else
+	Data->bSimulating  = false;
+	Data->SleepTime    = 0.0f;
+	Data->FallTime     = 0.0f;
+	Data->bWasSleeping = false;
 #endif
 
 	// Add new slot mapping AFTER Data points to the target slot.
 	AddSlotMapping(ID);
 
-	RebuildSlotMappingForComponent(StorageISMC);
+	RebuildSlotMappingForComponent(StorageISMC_Base);
 	RebuildSlotMappingForComponent(TargetISMC);
 
-	StorageISMC->MarkRenderStateDirty();
+#if PHYSICS_INTERFACE_PHYSX
+	// Queue for scene insertion AFTER rebinding.
+	EnqueueAddActorToScene(ID, TargetISMC);
+#endif
+
+	StorageISMC_Base->MarkRenderStateDirty();
 	TargetISMC->MarkRenderStateDirty();
 
 	// Optional: auto-destroy empty storage actors.
-	if (StorageActor->RegisteredInstanceIDs.Num() == 0 && StorageActor->InstancedMesh && StorageActor->InstancedMesh->GetInstanceCount() == 0)
+	if (StorageActor != TargetActor &&
+		StorageActor->RegisteredInstanceIDs.Num() == 0 &&
+		StorageActor->InstancedMesh &&
+		StorageActor->InstancedMesh->GetInstanceCount() == 0)
 	{
 		if (StorageActor->PhysXActorID.IsValid())
 		{
@@ -2539,8 +3463,10 @@ bool UPhysXInstancedWorldSubsystem::ConvertStorageInstanceToDynamic(
 		StorageActor->Destroy();
 	}
 
+	bConvertedSuccessfully = true;
 	return true;
 }
+
 
 bool UPhysXInstancedWorldSubsystem::IsInstancePhysicsEnabled(FPhysXInstanceID ID) const
 {
@@ -3522,6 +4448,14 @@ void UPhysXInstancedWorldSubsystem::FixInstanceIndicesAfterRemoval(
 
 bool UPhysXInstancedWorldSubsystem::RemoveInstanceByID(FPhysXInstanceID ID, bool bRemoveVisualInstance)
 {
+	return RemoveInstanceByID_Internal(ID, bRemoveVisualInstance, EPhysXInstanceRemoveReason::Explicit);
+}
+
+bool UPhysXInstancedWorldSubsystem::RemoveInstanceByID_Internal(
+	FPhysXInstanceID ID,
+	bool bRemoveVisualInstance,
+	EPhysXInstanceRemoveReason Reason)
+{
 	FPhysXInstanceData* Data = Instances.Find(ID);
 	if (!Data)
 	{
@@ -3532,17 +4466,38 @@ bool UPhysXInstancedWorldSubsystem::RemoveInstanceByID(FPhysXInstanceID ID, bool
 	int32 InstanceIndex = Data->InstanceIndex;
 	const bool bWasSimulating = Data->bSimulating;
 
-	APhysXInstancedMeshActor* OwnerActor = nullptr;
-	bool bOwnerIsStorageActor = false;
+	APhysXInstancedMeshActor* OwnerActor =
+		ISMC ? Cast<APhysXInstancedMeshActor>(ISMC->GetOwner()) : nullptr;
 
-	if (ISMC)
+	const bool bFirePre =
+		IsEventEnabled(OwnerActor, EPhysXInstanceEventFlags::PreRemove) &&
+		(OwnerActor->OnInstancePreRemove.IsBound() || HasInterfaceEvents(OwnerActor));
+
+	const bool bFirePost =
+		IsEventEnabled(OwnerActor, EPhysXInstanceEventFlags::PostRemove) &&
+		(OwnerActor->OnInstancePostRemove.IsBound() || HasInterfaceEvents(OwnerActor));
+
+	FTransform SnapshotTM = FTransform::Identity;
+	if (bFirePre || bFirePost)
 	{
-		OwnerActor = Cast<APhysXInstancedMeshActor>(ISMC->GetOwner());
-		if (OwnerActor)
+		GetInstanceWorldTransform_Safe(*Data, SnapshotTM);
+	}
+
+	if (bFirePre)
+	{
+		OwnerActor->OnInstancePreRemove.Broadcast(ID, Reason, SnapshotTM);
+
+		if (HasInterfaceEvents(OwnerActor))
 		{
-			bOwnerIsStorageActor = (OwnerActor->bIsStorageActor || OwnerActor->bStorageOnly);
-			OwnerActor->RegisteredInstanceIDs.Remove(ID);
+			IPhysXInstanceEvents::Execute_OnInstancePreRemove(OwnerActor, ID, Reason, SnapshotTM);
 		}
+	}
+
+	bool bOwnerIsStorageActor = false;
+	if (OwnerActor)
+	{
+		bOwnerIsStorageActor = (OwnerActor->bIsStorageActor || OwnerActor->bStorageOnly);
+		OwnerActor->RegisteredInstanceIDs.Remove(ID);
 	}
 
 	// -----------------------------
@@ -3568,16 +4523,33 @@ bool UPhysXInstancedWorldSubsystem::RemoveInstanceByID(FPhysXInstanceID ID, bool
 		--NumBodiesSimulating;
 	}
 
+	auto FirePost = [&](bool bSuccess)
+	{
+		if (!bFirePost)
+		{
+			return;
+		}
+
+		OwnerActor->OnInstancePostRemove.Broadcast(ID, Reason, SnapshotTM);
+
+		if (HasInterfaceEvents(OwnerActor))
+		{
+			IPhysXInstanceEvents::Execute_OnInstancePostRemove(OwnerActor, ID, Reason, SnapshotTM);
+		}
+	};
+
 	// If we do not need to remove the visual instance, we can drop the record now.
 	if (!bRemoveVisualInstance)
 	{
 		Instances.Remove(ID);
+		FirePost(/*bSuccess=*/true);
 		return true;
 	}
 
 	if (!ISMC || !ISMC->IsValidLowLevelFast() || InstanceIndex == INDEX_NONE)
 	{
 		Instances.Remove(ID);
+		FirePost(/*bSuccess=*/false);
 		return false;
 	}
 
@@ -3608,6 +4580,7 @@ bool UPhysXInstancedWorldSubsystem::RemoveInstanceByID(FPhysXInstanceID ID, bool
 				ID.GetUniqueID(), *GetNameSafe(ISMC));
 
 			Instances.Remove(ID);
+			FirePost(/*bSuccess=*/false);
 			return false;
 		}
 
@@ -3616,7 +4589,7 @@ bool UPhysXInstancedWorldSubsystem::RemoveInstanceByID(FPhysXInstanceID ID, bool
 
 	const int32 OldLastIndex = ISMC->GetInstanceCount() - 1;
 
-	// Drop the record BEFORE mutating indices of others? (Either order is OK as long as we fix others based on removal index.)
+	// Drop the record BEFORE mutating indices of others.
 	Instances.Remove(ID);
 
 	const bool bRemoved = ISMC->RemoveInstance(InstanceIndex);
@@ -3627,6 +4600,7 @@ bool UPhysXInstancedWorldSubsystem::RemoveInstanceByID(FPhysXInstanceID ID, bool
 			*GetNameSafe(ISMC), InstanceIndex);
 
 		RebuildSlotMappingForComponent(ISMC);
+		FirePost(/*bSuccess=*/false);
 		return false;
 	}
 
@@ -3660,6 +4634,8 @@ bool UPhysXInstancedWorldSubsystem::RemoveInstanceByID(FPhysXInstanceID ID, bool
 
 	RebuildSlotMappingForComponent(ISMC);
 	ISMC->MarkRenderStateDirty();
+
+	FirePost(/*bSuccess=*/true);
 
 	// Optional: auto-destroy empty storage actors to avoid accumulating dead containers.
 	if (bOwnerIsStorageActor && OwnerActor && OwnerActor->InstancedMesh)
@@ -3727,7 +4703,7 @@ void UPhysXInstancedWorldSubsystem::ProcessPendingAddActors()
 
 	for (int32 Index = PendingAddActorsHead; Index < EndIndex; ++Index)
 	{
-		const FPendingAddActorEntry& Entry = PendingAddActors[Index];
+		FPendingAddActorEntry& Entry = PendingAddActors[Index];
 
 		if (!Entry.ID.IsValid())
 		{
@@ -3749,6 +4725,15 @@ void UPhysXInstancedWorldSubsystem::ProcessPendingAddActors()
 		FPhysXInstanceData* Data = Instances.Find(Entry.ID);
 		if (!Data)
 		{
+			Entry.ID = FPhysXInstanceID(); // stale entry
+			continue;
+		}
+
+		// IMPORTANT(PXIS_DEFERRED_ADD):
+		// Body might have been destroyed/replaced after enqueue but before processing.
+		if (!Data->Body.GetPxActor())
+		{
+			Entry.ID = FPhysXInstanceID(); // prevent repeated retries/budget waste
 			continue;
 		}
 
@@ -3927,41 +4912,32 @@ bool UPhysXInstancedWorldSubsystem::TryExecuteInstanceTask(FPhysXInstanceTask& T
 		return false; // retry later
 	}
 
-	switch (Task.Type)
-	{
-	case EPhysXInstanceTaskType::AddImpulse:
-	{
-		const physx::PxVec3 PxImpulse = U2PVector(Task.Vector);
-		const physx::PxForceMode::Enum Mode = Task.bModeFlag
-			? physx::PxForceMode::eVELOCITY_CHANGE
-			: physx::PxForceMode::eIMPULSE;
+	using FTaskHandler = bool (UPhysXInstancedWorldSubsystem::*)(FPhysXInstanceTask&, physx::PxRigidDynamic*);
 
-		RD->addForce(PxImpulse, Mode, /*autowake=*/true);
+	static const FTaskHandler Handlers[] =
+	{
+		&UPhysXInstancedWorldSubsystem::HandleInstanceTask_AddImpulse,  // AddImpulse
+		&UPhysXInstancedWorldSubsystem::HandleInstanceTask_AddForce,    // AddForce
+		&UPhysXInstancedWorldSubsystem::HandleInstanceTask_PutToSleep,  // PutToSleep
+		&UPhysXInstancedWorldSubsystem::HandleInstanceTask_WakeUp       // WakeUp
+	};
+
+	static_assert(UE_ARRAY_COUNT(Handlers) == (int32)EPhysXInstanceTaskType::Count, "Instance task handler table mismatch.");
+
+	const int32 TypeIndex = (int32)Task.Type;
+	if (TypeIndex < 0 || TypeIndex >= (int32)EPhysXInstanceTaskType::Count)
+	{
 		return true;
 	}
 
-	case EPhysXInstanceTaskType::AddForce:
+	FTaskHandler Handler = Handlers[TypeIndex];
+	if (!Handler)
 	{
-		const physx::PxVec3 PxForce = U2PVector(Task.Vector);
-		const physx::PxForceMode::Enum Mode = Task.bModeFlag
-			? physx::PxForceMode::eACCELERATION
-			: physx::PxForceMode::eFORCE;
-
-		RD->addForce(PxForce, Mode, /*autowake=*/true);
 		return true;
 	}
 
-	case EPhysXInstanceTaskType::PutToSleep:
-		RD->putToSleep();
-		return true;
+	return (this->*Handler)(Task, RD);
 
-	case EPhysXInstanceTaskType::WakeUp:
-		RD->wakeUp();
-		return true;
-
-	default:
-		return true; // drop unknown
-	}
 }
 #endif // PHYSICS_INTERFACE_PHYSX
 
